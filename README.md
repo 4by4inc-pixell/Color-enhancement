@@ -2,9 +2,21 @@
 
 ## Overview
  
-## Requirements
-
 ## Installation
+
+- Make Conda Environment
+```bash
+conda create -n ColEn python=3.9 -y
+conda activate ColEn
+```
+- Install Dependencies
+```bash
+conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
+
+pip install 
+
+pip install 
+```
 
 ## Download Pre-trained Models
 
