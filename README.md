@@ -20,8 +20,6 @@ pip install
 
 ## Download Pre-trained Models
 
-## Download Datasets
-
 ## File Paths
 
 ## Quantitative evaluation
