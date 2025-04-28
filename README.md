@@ -53,11 +53,12 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
   </tr>
   <tr>
     <td><strong>Version-0326</strong></td>
-    <td><img src="https://github.com/user-attachments/assets/c2a9da3d-133d-44a5-b414-9e28af85acd2" width="700"/></td>
+    <td><img src="https://github.com/user-attachments/assets/a2317926-6922-4008-a962-fa122cc556fc" width="700"/></td>
   </tr>
 </table>
 
 ---
+
 
 ### Compare Model Outputs - Image 2
 
@@ -68,11 +69,12 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
   </tr>
   <tr>
     <td><strong>Version-0326</strong></td>
-    <td><img src="https://github.com/user-attachments/assets/fb99a2df-4982-4b17-8a7d-a95f1f6f1d98" width="700"/></td>
+    <td><img src="https://github.com/user-attachments/assets/6126a620-77fa-4782-91d2-a1e162ed11b6" width="700"/></td>
   </tr>
 </table>
 
 ---
+
 
 ### Compare Model Outputs - Image 3
 
@@ -83,11 +85,12 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
   </tr>
   <tr>
     <td><strong>Version-0326</strong></td>
-    <td><img src="https://github.com/user-attachments/assets/5606d6cf-38a7-418f-b9b7-c78dfd80ed3c" width="700"/></td>
+    <td><img src="https://github.com/user-attachments/assets/010c9134-f6e3-4e04-b496-8e0258b435bd" width="700"/></td>
   </tr>
 </table>
 
 ---
+
 
 ### Compare Model Outputs - Image 4
 
@@ -98,7 +101,7 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
   </tr>
   <tr>
     <td><strong>Version-0326</strong></td>
-    <td><img src="https://github.com/user-attachments/assets/ef30a5cb-6fd0-411b-9dc9-d354f60ca30d" width="700"/></td>
+    <td><img src="https://github.com/user-attachments/assets/dedef762-d693-456f-b71d-3740b385a2c" width="700"/></td>
   </tr>
 </table>
 
@@ -113,10 +116,9 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
   </tr>
   <tr>
     <td><strong>Version-0326</strong></td>
-    <td><img src="https://github.com/user-attachments/assets/fe1dfff0-bb7a-413c-8154-b4da7892a171" width="700"/></td>
+    <td><img src="https://github.com/user-attachments/assets/429f94c0-5a04-4d30-83ae-1c61238d2a82" width="700"/></td>
   </tr>
 </table>
-
 
 
 
