@@ -1,6 +1,12 @@
 # Color-enhancement
 
 ## Overview
+Color-enhancement is a task that improves the color quality of images and videos that lack color information. 
+This process aims to restore or improve the sharpness, saturation, and overall color balance of colors to create visually more natural and rich results. 
+This model was developed to effectively perform these color-enhances.
+To illustrate the model in detail, we decompose RGB input into YCbCr color space, denoise chrominance components (Cb, Cr) separately, and use spatial feature extraction blocks and global attention mechanisms to improve luminance features (Y). 
+The model handles triple frames to promote temporal consistency, and optimizes output quality, color fidelity, and inter-frame consistency using a comprehensive set of loss functions including perceptual, MS-SSIM, HSV color, edge, and optical flow-based time loss.
+The system supports PyTorch and ONNX workflows for large-scale applications and an efficient multi-GPU inference pipeline.
  
 ## Installation
 
