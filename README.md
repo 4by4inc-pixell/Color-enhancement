@@ -101,7 +101,7 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
   </tr>
   <tr>
     <td><strong>Version-0326</strong></td>
-    <td><img src="https://github.com/user-attachments/assets/dedef762-d693-456f-b71d-3740b385a2c" width="700"/></td>
+    <td><img src="https://github.com/user-attachments/assets/bb6991de-089f-46f5-bfac-0729da5000b3" width="700"/></td>
   </tr>
 </table>
 
