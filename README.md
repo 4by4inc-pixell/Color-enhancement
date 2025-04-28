@@ -34,10 +34,10 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
 
 <div align="center">
   
-| Dataset               | 300 Image test  |            |
-|:---------------------:|:---------------:|:----------:|
-|                       | PSNR            | SSIM       |
-|  Custom test dataset  | 23.76           |  0.9540    |
+| Dataset               |  300 Image test |            
+|:---------------------:|:---------------:|
+|                       |   PSNR / SSIM   |
+|  Custom test dataset  |  23.76 / 0.9540 |
 
 </div>
 
