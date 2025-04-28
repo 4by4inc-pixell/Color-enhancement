@@ -42,16 +42,6 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
 
 </div>
 
-### Inference time
-<div align="center">
-  
-| Dataset               |  Pytorch model  |    ONNX model   |          
-|:---------------------:|:---------------:|:---------------:|
-|                       |   PSNR / SSIM   |   PSNR / SSIM   |
-|  300 images testset   |  23.76 / 0.9540 |  23.76 / 0.9540 |
-
-</div>
-
 
 ## Qualitative evaluation
 
