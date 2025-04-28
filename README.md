@@ -34,10 +34,10 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
 
 <div align="center">
   
-| Dataset               | Version-0321 |            | Version-0326 |            |
+| Dataset               | 90 Image test |           | 300 Image test  |            |
 |:---------------------:|:------------:|:----------:|:------------:|:----------:|
-|                       | PSNR         | SSIM       | PSNR         | SSIM       |
-|  Custom test dataset  |  22.88       |  0.9037    | 24.28        |  0.9242    |
+|                       | Total inference time       | Frame per inference time       | PSNR         | SSIM       |
+|  Custom test dataset  |  6.17 s       |  205.50 ms/frame    | 23.76        |  0.9540    |
 
 </div>
 
