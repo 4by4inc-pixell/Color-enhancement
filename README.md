@@ -28,6 +28,8 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
 
 ## Download Pre-trained Models
 
+Download pretrained models: [Color enhancement](https://drive.google.com/file/d/1wyKLu4RdF-uBw-QJWNcV9AxreGFC9CnE/view?usp=sharing).
+
 ## File Paths
 
 ## Quantitative evaluation
