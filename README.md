@@ -7,7 +7,12 @@ To address this task, we'd like to propose a model that operates by first transf
 The chrominance components (Cb and Cr) are individually denoised, while spatial feature extraction blocks and a global attention mechanism are employed to enhance the luminance component (Y). 
 The model processes triplet frames to promote temporal consistency, and it is trained using a comprehensive set of loss functions, including perceptual loss, MS-SSIM loss, HSV color loss, edge loss, and optical flow-based temporal loss.
 Furthermore, the system is compatible with both PyTorch and ONNX frameworks and supports efficient multi-GPU inference pipelines, making it suitable for large-scale deployment.
- 
+
+## Requirements
+- CUDA 11.8
+- CUDNN 8.9.2.26
+- Python 3.9.21
+
 ## Installation
 
 - Make Conda Environment
