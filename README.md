@@ -10,8 +10,8 @@ Furthermore, the system is compatible with both PyTorch and ONNX frameworks and 
 
 ## Requirements
 - CUDA 11.8
-- CUDNN 8.9.2.26
-- Python 3.9.21
+- CUDNN 8.9
+- Python 3.9
 
 ## Installation
 
