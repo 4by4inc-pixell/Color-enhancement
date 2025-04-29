@@ -24,11 +24,10 @@ conda activate ColEn
 ```bash
 conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
 
-pip install onnx==1.14.0 / pip install onnxruntime-gpu==1.15.0
+conda install -c nvidia cudatoolkit=11.8 cudnn=8.9 -y
 
-pip install matplotlib scikit-learn scikit-image opencv-python yacs joblib natsort h5py tqdm tensorboard
+pip install -r requirements.txt
 
-pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpips thop timm torchmetrics pytorch_msssim
 ```
 
 ## Download Pre-trained Models
