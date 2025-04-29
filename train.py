@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision.utils import save_image
 from torchmetrics.functional import structural_similarity_index_measure
-from model import LYT
+from model import ColEn
 from losses import CombinedLoss
 from dataloader import create_dataloaders
 import os
@@ -79,7 +79,7 @@ def main():
 
     print(f'Train loader: {len(train_loader)}, Test loader: {len(test_loader)}')
 
-    model = LYT().to(device)
+    model = ColEn().to(device)
     criterion = CombinedLoss(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)

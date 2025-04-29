@@ -91,7 +91,7 @@ class Denoiser(nn.Module):
         x3 = F.interpolate(x3, size=x.shape[-2:], mode='bilinear', align_corners=False)
         return torch.tanh(self.out_conv(x3))
 
-class LYT(nn.Module):
+class ColEn(nn.Module):
     def __init__(self, filters=32):
         super().__init__()
         self.process_y = nn.Conv2d(1, filters, 3, padding=1)
