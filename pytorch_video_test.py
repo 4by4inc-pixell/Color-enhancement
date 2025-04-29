@@ -174,10 +174,6 @@ def enhance_video_triplet_distributed(input_video, model_path, output_folder=Non
 
     total_frames_processed = sum([return_dict[r]['frames'] for r in return_dict])
     print("\n===== Inference Summary =====")
-    for rank in sorted(return_dict.keys()):
-        t = return_dict[rank]
-        print(f"GPU {rank} Inference Time: {t['time']:.2f}s ({t['avg_ms']:.2f} ms/frame)")
-
     print(f"Total Inference Time: {total_time:.2f}s")
     if total_frames_processed > 0:
         print(f"Average Inference Time per Frame: {(total_time / total_frames_processed) * 1000:.2f} ms/frame")
