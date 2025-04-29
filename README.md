@@ -29,6 +29,7 @@ pip install einops gdown addict future lmdb numpy pyyaml requests scipy yapf lpi
 ## Download Pre-trained Models
 
 Download pytorch models: [Pytorch model](https://drive.google.com/file/d/1bSs45h3zDqmimXkJAgueDzIUNG5I7KZQ/view?usp=sharing).
+
 Download onnx models: [ONNX model](https://drive.google.com/file/d/1wyKLu4RdF-uBw-QJWNcV9AxreGFC9CnE/view?usp=sharing).
 
 ## File Paths
