@@ -1,69 +1,108 @@
+import torch
 import argparse
 import os
 import cv2
 import numpy as np
 import onnxruntime as ort
 import time
+import torch.multiprocessing as mp
+import shutil
 from tqdm import tqdm
-import multiprocessing as mp
+from multiprocessing import Manager
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-def parse_gpu_ids(s):
-    return [int(x) for x in s.split(',') if x.strip().isdigit()]
-
-def preprocess_frame_opencv(frame, max_res=3072):
-    orig_h, orig_w = frame.shape[:2]
-    resize_flag = False
-    if max(orig_w, orig_h) > max_res:
-        scale = max_res / max(orig_w, orig_h)
-        new_size = (int(orig_w * scale), int(orig_h * scale))
-        frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_CUBIC)
-        resize_flag = True
-
+def preprocess_frame(frame):
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    tensor = np.transpose(frame_rgb, (2, 0, 1))[np.newaxis, ...]
-    return tensor, resize_flag, (orig_w, orig_h)
+    return np.transpose(frame_rgb, (2, 0, 1))
 
-def postprocess_output(output_tensor, resize_flag, orig_size):
-    output_tensor = np.clip(output_tensor.squeeze(0), 0, 1) * 1.1
-    output_tensor = np.clip(output_tensor, 0, 1)
-    output_image = (output_tensor.transpose(1, 2, 0) * 255).astype(np.uint8)
-    output_image = cv2.cvtColor(output_image, cv2.COLOR_RGB2BGR)
-    if resize_flag:
-        output_image = cv2.resize(output_image, orig_size, interpolation=cv2.INTER_CUBIC)
-    return output_image
+def tensor_to_cv_image(tensor):
+    tensor = np.clip(tensor, 0, 1) * 1.0
+    tensor = (tensor.transpose(1, 2, 0) * 255).astype(np.uint8)
+    return cv2.cvtColor(tensor, cv2.COLOR_RGB2BGR)
 
-def worker_process(gpu_id, job_indices, frames, model_path, max_res, result_queue):
-    providers = [('CUDAExecutionProvider', {'device_id': gpu_id}), 'CPUExecutionProvider']
+def extract_patches_with_overlap(img_tensor, patch_size, stride):
+    c, h, w = img_tensor.shape
+    pad_h = (stride - h % stride) % stride
+    pad_w = (stride - w % stride) % stride
+    padded = np.pad(img_tensor, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+    patches, positions = [], []
+
+    for y in range(0, padded.shape[1] - patch_size + 1, stride):
+        for x in range(0, padded.shape[2] - patch_size + 1, stride):
+            patch = padded[:, y:y + patch_size, x:x + patch_size]
+            patches.append(patch)
+            positions.append((y, x))
+
+    return patches, positions, (h, w), padded.shape[1:]
+
+def merge_patches_with_weights(patches, positions, orig_size, padded_size, patch_size, stride):
+    c = patches[0].shape[0]
+    canvas = np.zeros((c, *padded_size), dtype=np.float32)
+    weight_map = np.zeros_like(canvas)
+
+    hann = np.outer(np.hanning(patch_size), np.hanning(patch_size)).astype(np.float32)
+    weight = np.tile(hann[None, :, :], (c, 1, 1))
+
+    for patch, (y, x) in zip(patches, positions):
+        canvas[:, y:y + patch_size, x:x + patch_size] += patch * weight
+        weight_map[:, y:y + patch_size, x:x + patch_size] += weight
+
+    canvas /= (weight_map + 1e-8)
+    return canvas[:, :orig_size[0], :orig_size[1]]
+
+def process_video_chunk(rank, video_path, model_path, frame_range, patch_size, stride, temp_dir, return_dict):
+    providers = [('CUDAExecutionProvider', {'device_id': rank}), 'CPUExecutionProvider']
     session = ort.InferenceSession(model_path, providers=providers)
     input_name = session.get_inputs()[0].name
 
-    for idx in job_indices:
-        total_frames = len(frames)
-        t_indices = [max(0, idx - 1), idx, min(total_frames - 1, idx + 1)]
-        triplet = [frames[i] for i in t_indices]
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames = [cap.read()[1] for _ in range(total_frames)]
+    cap.release()
 
-        tensors, resize_flags, orig_sizes = [], [], []
-        for frame in triplet:
-            tensor, resize_flag, orig_size = preprocess_frame_opencv(frame, max_res)
-            tensors.append(tensor)
-            resize_flags.append(resize_flag)
-            orig_sizes.append(orig_size)
+    alpha = 0.25
+    prev_output = None
+    start_time = time.time()
 
-        input_tensor = np.concatenate(tensors, axis=1)
+    gpu_temp_dir = os.path.join(temp_dir, f"gpu{rank}")
+    os.makedirs(gpu_temp_dir, exist_ok=True)
 
-        start_time = time.time()
-        ort_outs = session.run(None, {input_name: input_tensor})
-        elapsed = time.time() - start_time
+    for i in tqdm(frame_range, desc=f"GPU {rank}", ncols=80):
+        i0, i1, i2 = max(i - 1, 0), i, min(i + 1, total_frames - 1)
+        triplet_tensors = [preprocess_frame(frames[k]) for k in [i0, i1, i2]]
+        input_tensor = np.concatenate(triplet_tensors, axis=0)
 
-        output_frame = postprocess_output(ort_outs[0], resize_flags[1], orig_sizes[1])
-        result_queue.put((idx, output_frame, elapsed * 1000))  
+        patches, positions, orig_size, padded_size = extract_patches_with_overlap(input_tensor, patch_size, stride)
+        outputs = []
 
-def enhance_video_onnx(input_video, model_path, output_folder=None, max_res=3072, gpu_ids=[0]):
-    overall_start = time.time()
-    num_gpus = len(gpu_ids)
+        for patch in patches:
+            patch = patch[None, ...].astype(np.float32)
+            out_patch = session.run(None, {input_name: patch})[0][0]
+            outputs.append(out_patch)
+
+        merged = merge_patches_with_weights(outputs, positions, orig_size, padded_size, patch_size, stride)
+        output_frame = tensor_to_cv_image(merged)
+
+        if prev_output is not None:
+            output_frame = cv2.addWeighted(prev_output, alpha, output_frame, 1 - alpha, 0)
+        prev_output = output_frame.copy()
+
+        save_path = os.path.join(gpu_temp_dir, f"frame_{i:06d}.png")
+        cv2.imwrite(save_path, output_frame)
+
+    elapsed = time.time() - start_time
+    return_dict[rank] = {
+        'time': elapsed,
+        'frames': len(frame_range),
+        'avg_ms': (elapsed / len(frame_range) * 1000) if len(frame_range) > 0 else 0
+    }
+
+def enhance_video_onnx_distributed(input_video, model_path, output_folder=None, patch_size=512, stride=256):
+    start_time = time.time()
+    num_gpus = torch.cuda.device_count()
+    assert num_gpus > 0, "No CUDA devices available."
 
     input_dir, input_filename = os.path.split(input_video)
     name, ext = os.path.splitext(input_filename)
@@ -75,80 +114,56 @@ def enhance_video_onnx(input_video, model_path, output_folder=None, max_res=3072
         output_video_path = os.path.join(input_dir, f"Enhanced_{name}{ext}")
 
     cap = cv2.VideoCapture(input_video)
-    if not cap.isOpened():
-        print("Error: Could not open video.")
-        return
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(frame)
+    fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
 
-    total_frames = len(frames)
-    print(f"Processing Video: {input_video}")
+    print("\n===== Video Info =====")
+    print(f"Input Video: {input_video}")
     print(f"Resolution: {frame_width}x{frame_height}, FPS: {fps:.2f}, Total Frames: {total_frames}")
-    print(f"Using GPUs: {gpu_ids}")
+    print(f"Using {num_gpus} GPUs")
 
-    job_indices = list(range(total_frames))
-    chunks = [job_indices[i::num_gpus] for i in range(num_gpus)]
+    chunks = np.array_split(list(range(total_frames)), num_gpus)
+    manager = Manager()
+    return_dict = manager.dict()
+    temp_dir = os.path.join(output_folder or input_dir, f"temp_frames_{name}")
+    os.makedirs(temp_dir, exist_ok=True)
 
-    result_queue = mp.Queue()
     processes = []
-    for i, gpu_id in enumerate(gpu_ids):
-        p = mp.Process(target=worker_process, args=(
-            gpu_id, chunks[i], frames, model_path, max_res, result_queue
-        ))
+    for rank in range(num_gpus):
+        if len(chunks[rank]) == 0:
+            continue
+        p = mp.Process(target=process_video_chunk, args=(rank, input_video, model_path, chunks[rank], patch_size, stride, temp_dir, return_dict))
         p.start()
         processes.append(p)
-
-    all_outputs = [None] * total_frames
-    total_ms_time = 0
-    with tqdm(total=total_frames, desc="Inference", ncols=80) as pbar:
-        for _ in range(total_frames):
-            idx, output_frame, elapsed_ms = result_queue.get()
-            all_outputs[idx] = output_frame
-            total_ms_time += elapsed_ms
-            pbar.update(1)
 
     for p in processes:
         p.join()
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
-    for frame in all_outputs:
-        out.write(frame)
+    frame_files = sorted([os.path.join(root, file) for root, _, files in os.walk(temp_dir) for file in files if file.endswith('.png')])
+    out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (frame_width, frame_height))
+    for frame_path in frame_files:
+        out.write(cv2.imread(frame_path))
     out.release()
 
-    total_elapsed = time.time() - overall_start
+    shutil.rmtree(temp_dir)
+    total_elapsed = time.time() - start_time
 
-    print(f"\n===== Inference Summary =====")
+    print("\n===== Inference Summary =====")
     print(f"Total Inference Time: {total_elapsed:.2f}s")
-    if total_frames > 0:
-        print(f"Average Inference Time per Frame: {(total_elapsed / total_frames) * 1000:.2f} ms/frame")
-    print(f"Enhanced video saved as: {output_video_path}")
+    print(f"Average Inference Time per Frame: {(total_elapsed / total_frames) * 1000:.2f} ms/frame")
+    print(f"Final enhanced video saved at: {output_video_path}")
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
-
-    parser = argparse.ArgumentParser(description="Enhance video using ONNX model (Triplet Input with OpenCV preprocessing)")
+    parser = argparse.ArgumentParser(description="ONNX Video Enhancement with Multi-GPU Triplet Input")
     parser.add_argument("--input_video", type=str, required=True)
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--output_folder", type=str, default=None)
-    parser.add_argument("--max_res", type=int, default=3072)
-    parser.add_argument("--gpu_ids", type=parse_gpu_ids, default=[0], help="Comma-separated GPU IDs (e.g., 0,1,2)")
+    parser.add_argument("--patch_size", type=int, default=512)
+    parser.add_argument("--stride", type=int, default=256)
     args = parser.parse_args()
 
-    enhance_video_onnx(
-        input_video=args.input_video,
-        model_path=args.model_path,
-        output_folder=args.output_folder,
-        max_res=args.max_res,
-        gpu_ids=args.gpu_ids
-    )
+    enhance_video_onnx_distributed(args.input_video, args.model_path, args.output_folder, args.patch_size, args.stride)
