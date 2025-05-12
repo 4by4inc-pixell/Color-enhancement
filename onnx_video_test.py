@@ -52,12 +52,13 @@ def merge_patches_with_weights(patches, positions, orig_size, padded_size, patch
     canvas /= (weight_map + 1e-8)
     return canvas[:, :orig_size[0], :orig_size[1]]
 
-def process_video_chunk(rank, video_path, model_path, frame_range, patch_size, stride, temp_dir, return_dict):
-    providers = [('CUDAExecutionProvider', {'device_id': rank}), 'CPUExecutionProvider']
-    session = ort.InferenceSession(model_path, providers=providers)
+def process_video_chunk(rank, args, available_gpus, frame_range, temp_dir, return_dict):
+    device_id = available_gpus[rank]
+    providers = [('CUDAExecutionProvider', {'device_id': device_id}), 'CPUExecutionProvider']
+    session = ort.InferenceSession(args.model_path, providers=providers)
     input_name = session.get_inputs()[0].name
 
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(args.input_video)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frames = [cap.read()[1] for _ in range(total_frames)]
     cap.release()
@@ -69,12 +70,12 @@ def process_video_chunk(rank, video_path, model_path, frame_range, patch_size, s
     gpu_temp_dir = os.path.join(temp_dir, f"gpu{rank}")
     os.makedirs(gpu_temp_dir, exist_ok=True)
 
-    for i in tqdm(frame_range, desc=f"GPU {rank}", ncols=80):
+    for i in tqdm(frame_range, desc=f"GPU {device_id}", ncols=80):
         i0, i1, i2 = max(i - 1, 0), i, min(i + 1, total_frames - 1)
         triplet_tensors = [preprocess_frame(frames[k]) for k in [i0, i1, i2]]
         input_tensor = np.concatenate(triplet_tensors, axis=0)
 
-        patches, positions, orig_size, padded_size = extract_patches_with_overlap(input_tensor, patch_size, stride)
+        patches, positions, orig_size, padded_size = extract_patches_with_overlap(input_tensor, args.patch_size, args.stride)
         outputs = []
 
         for patch in patches:
@@ -82,7 +83,7 @@ def process_video_chunk(rank, video_path, model_path, frame_range, patch_size, s
             out_patch = session.run(None, {input_name: patch})[0][0]
             outputs.append(out_patch)
 
-        merged = merge_patches_with_weights(outputs, positions, orig_size, padded_size, patch_size, stride)
+        merged = merge_patches_with_weights(outputs, positions, orig_size, padded_size, args.patch_size, args.stride)
         output_frame = tensor_to_cv_image(merged)
 
         if prev_output is not None:
@@ -99,21 +100,22 @@ def process_video_chunk(rank, video_path, model_path, frame_range, patch_size, s
         'avg_ms': (elapsed / len(frame_range) * 1000) if len(frame_range) > 0 else 0
     }
 
-def enhance_video_onnx_distributed(input_video, model_path, output_folder=None, patch_size=512, stride=256):
+def enhance_video_onnx_distributed(args):
     start_time = time.time()
-    num_gpus = torch.cuda.device_count()
-    assert num_gpus > 0, "No CUDA devices available."
+    available_gpus = args.gpus
+    num_gpus = len(available_gpus)
+    assert num_gpus > 0, "No GPUs specified."
 
-    input_dir, input_filename = os.path.split(input_video)
+    input_dir, input_filename = os.path.split(args.input_video)
     name, ext = os.path.splitext(input_filename)
 
-    if output_folder:
-        os.makedirs(output_folder, exist_ok=True)
-        output_video_path = os.path.join(output_folder, f"Enhanced_{name}{ext}")
+    if args.output_folder:
+        os.makedirs(args.output_folder, exist_ok=True)
+        output_video_path = os.path.join(args.output_folder, f"Enhanced_{name}{ext}")
     else:
         output_video_path = os.path.join(input_dir, f"Enhanced_{name}{ext}")
 
-    cap = cv2.VideoCapture(input_video)
+    cap = cv2.VideoCapture(args.input_video)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -121,21 +123,21 @@ def enhance_video_onnx_distributed(input_video, model_path, output_folder=None, 
     cap.release()
 
     print("\n===== Video Info =====")
-    print(f"Input Video: {input_video}")
+    print(f"Input Video: {args.input_video}")
     print(f"Resolution: {frame_width}x{frame_height}, FPS: {fps:.2f}, Total Frames: {total_frames}")
-    print(f"Using {num_gpus} GPUs")
+    print(f"Using {num_gpus} GPUs: {available_gpus}")
 
     chunks = np.array_split(list(range(total_frames)), num_gpus)
     manager = Manager()
     return_dict = manager.dict()
-    temp_dir = os.path.join(output_folder or input_dir, f"temp_frames_{name}")
+    temp_dir = os.path.join(args.output_folder or input_dir, f"temp_frames_{name}")
     os.makedirs(temp_dir, exist_ok=True)
 
     processes = []
     for rank in range(num_gpus):
         if len(chunks[rank]) == 0:
             continue
-        p = mp.Process(target=process_video_chunk, args=(rank, input_video, model_path, chunks[rank], patch_size, stride, temp_dir, return_dict))
+        p = mp.Process(target=process_video_chunk, args=(rank, args, available_gpus, chunks[rank], temp_dir, return_dict))
         p.start()
         processes.append(p)
 
@@ -162,8 +164,9 @@ if __name__ == "__main__":
     parser.add_argument("--input_video", type=str, required=True)
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--output_folder", type=str, default=None)
-    parser.add_argument("--patch_size", type=int, default=512)
-    parser.add_argument("--stride", type=int, default=256)
+    parser.add_argument("--patch_size", type=int, default=1280)
+    parser.add_argument("--stride", type=int, default=640)
+    parser.add_argument("--gpus", type=int, nargs='+', required=True, help="List of GPU ids to use (e.g., --gpus 0 1 2)")
     args = parser.parse_args()
 
-    enhance_video_onnx_distributed(args.input_video, args.model_path, args.output_folder, args.patch_size, args.stride)
+    enhance_video_onnx_distributed(args)
