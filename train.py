@@ -1,15 +1,13 @@
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torchvision.utils import save_image
 from torchmetrics.functional import structural_similarity_index_measure
-from model import ColEn
+from torch.utils.tensorboard import SummaryWriter
+from model import FusionLYT
 from losses import CombinedLoss
 from dataloader import create_dataloaders
 import os
-from torch.utils.tensorboard import SummaryWriter
 
 def calculate_psnr(img1, img2, max_pixel_value=1.0):
     mse = F.mse_loss(img1, img2, reduction='mean')
@@ -30,14 +28,14 @@ def validate(model, dataloader, device):
 
     with torch.no_grad():
         for batch in dataloader:
-            input_seq = [img.to(device) for img in batch['low']]       
-            target_seq = [img.to(device) for img in batch['high']]     
+            input_seq = [img.to(device) for img in batch['low']]
+            target_seq = [img.to(device) for img in batch['high']]
 
-            input_tensor = torch.cat(input_seq, dim=1)  
-            target_tensor = target_seq[1]             
+            input_tensor = torch.cat(input_seq, dim=1)
+            target_tensor = target_seq[1]
 
             pred_seq = model(input_tensor)
-            pred = torch.clamp(pred_seq[1], 0, 1)
+            pred = torch.clamp(pred_seq[0], 0, 1)
             target_tensor = torch.clamp(target_tensor, 0, 1)
 
             psnr = calculate_psnr(pred, target_tensor)
@@ -60,50 +58,50 @@ def main():
         'input': './data/Custom_triplet/Train/input',
         'target': './data/Custom_triplet/Train/target'
     }
-    test_dirs = {
-        'input': './data/Custom_triplet/Test/input'
+    val_dirs = {
+        'input': './data/Custom_triplet/Val/input',
+        'target': './data/Custom_triplet/Val/target'
     }
 
     learning_rate = 2e-4
     num_epochs = 1000
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'LR: {learning_rate}, Epochs: {num_epochs}')
-    
-    train_loader, test_loader = create_dataloaders(
+
+    train_loader, _, val_loader = create_dataloaders(
         train_low=train_dirs['input'],
         train_high=train_dirs['target'],
-        test_low=test_dirs['input'],
+        val_low=val_dirs['input'],
+        val_high=val_dirs['target'],
         crop_size=256,
         batch_size=1
     )
 
-    print(f'Train loader: {len(train_loader)}, Test loader: {len(test_loader)}')
+    print(f'Train loader: {len(train_loader)}, Val loader: {len(val_loader)}')
 
-    model = ColEn().to(device)
+    model = FusionLYT().to(device)
     criterion = CombinedLoss(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
     scaler = torch.amp.GradScaler()
 
-    best_psnr = 0.0
+    best_val_psnr = 0.0
+    writer = SummaryWriter(log_dir="logs/Fusion_Enhance")
     print('Training started.')
-
-    writer = SummaryWriter(log_dir="logs/Version_0408_S")
 
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
-        
-        for i, batch in enumerate(train_loader):
-            input_seq = [img.to(device) for img in batch['low']]       
-            target_seq = [img.to(device) for img in batch['high']]    
 
-            input_tensor = torch.cat(input_seq, dim=1)  
+        for i, batch in enumerate(train_loader):
+            input_seq = [img.to(device) for img in batch['low']]
+            target_seq = [img.to(device) for img in batch['high']]
+
+            input_tensor = torch.cat(input_seq, dim=1)
 
             optimizer.zero_grad()
 
-            output_seq = model(input_tensor)  
-
+            output_seq = model(input_tensor)
             loss = criterion(target_seq, output_seq, input_seq)
 
             scaler.scale(loss).backward()
@@ -115,24 +113,29 @@ def main():
             if i % 10 == 0:
                 writer.add_scalar("Loss/Train", loss.item(), epoch * len(train_loader) + i)
 
-        avg_psnr, avg_ssim = validate(model, train_loader, device)
-        print(f'Epoch {epoch + 1}/{num_epochs}, PSNR: {avg_psnr:.6f}, SSIM: {avg_ssim:.6f}')
+        train_psnr, train_ssim = validate(model, train_loader, device)
+        val_psnr, val_ssim = validate(model, val_loader, device)
 
-        writer.add_scalar("PSNR/Train", avg_psnr, epoch)
-        writer.add_scalar("SSIM/Train", avg_ssim, epoch)
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+        print(f"  ▶ Train PSNR: {train_psnr:.4f}, SSIM: {train_ssim:.4f}")
+        print(f"  ▶ Val   PSNR: {val_psnr:.4f}, SSIM: {val_ssim:.4f}")
+
+        writer.add_scalar("PSNR/Train", train_psnr, epoch)
+        writer.add_scalar("SSIM/Train", train_ssim, epoch)
+        writer.add_scalar("PSNR/Val", val_psnr, epoch)
+        writer.add_scalar("SSIM/Val", val_ssim, epoch)
         writer.add_scalar("Loss/Epoch", train_loss / len(train_loader), epoch)
 
         scheduler.step()
-            
-        if avg_psnr > best_psnr:
-            best_psnr = avg_psnr
-            save_path = f'saved_train_models/Version_0408_S/ColorEnhance_epoch{epoch + 1:04d}_psnr{best_psnr:.4f}.pth'
+
+        if val_psnr > best_val_psnr:
+            best_val_psnr = val_psnr
+            save_path = f'saved_train_models/Fusion_Enhance/ColorEnhance_epoch{epoch + 1:04d}_valpsnr{best_val_psnr:.4f}.pth'
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(model.state_dict(), save_path)
-            print(f'Saving new best model at epoch {epoch + 1} with PSNR: {best_psnr:.6f}')
+            print(f'Saving new best model at epoch {epoch + 1} with Val PSNR: {best_val_psnr:.4f}')
 
     writer.close()
 
 if __name__ == '__main__':
     main()
-
