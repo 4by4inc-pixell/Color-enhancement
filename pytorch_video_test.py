@@ -8,7 +8,7 @@ import time
 import torch.multiprocessing as mp
 import shutil
 import torch.nn.functional as F
-from model import LYT
+from model import FusionLYT
 from torch.amp import autocast
 from tqdm import tqdm
 from multiprocessing import Manager
@@ -58,7 +58,7 @@ def tensor_to_cv_image(tensor):
 
 def process_video_chunk(rank, video_path, model_path, frame_range, patch_size, stride, temp_dir, return_dict):
     device = torch.device(f"cuda:{rank}")
-    model = LYT().to(device)
+    model = FusionLYT().to(device)
     state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict(state_dict['model_state_dict'] if 'model_state_dict' in state_dict else state_dict)
     model.eval()
@@ -90,7 +90,7 @@ def process_video_chunk(rank, video_path, model_path, frame_range, patch_size, s
             for patch in patches:
                 patch = patch.unsqueeze(0).to(device)
                 with autocast(device_type='cuda'):
-                    out_patch = model(patch)[1].squeeze(0).cpu()
+                    out_patch = model(patch)[0].squeeze(0).cpu()
                 outputs.append(out_patch)
 
             merged_tensor = merge_patches_with_weights(outputs, positions, orig_size, padded_size, patch_size, stride)
@@ -193,9 +193,8 @@ if __name__ == "__main__":
     parser.add_argument("--input_video", type=str, required=True)
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--output_folder", type=str, default=None)
-    parser.add_argument("--patch_size", type=int, default=512)
-    parser.add_argument("--stride", type=int, default=256)
+    parser.add_argument("--patch_size", type=int, default=1280)
+    parser.add_argument("--stride", type=int, default=640)
     args = parser.parse_args()
 
     enhance_video_triplet_distributed(args.input_video, args.model_path, args.output_folder, args.patch_size, args.stride)
-
