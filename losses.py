@@ -3,19 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import vgg19, VGG19_Weights
 from pytorch_msssim import ms_ssim
-import torchvision.transforms.functional as TF
 import cv2
 import numpy as np
-
-class VGGPerceptualLoss(nn.Module):
-    def __init__(self, device):
-        super().__init__()
-        self.model = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features[:16].to(device).eval()
-        for p in self.model.parameters():
-            p.requires_grad = False
-
-    def forward(self, x, y):
-        return F.mse_loss(self.model(x), self.model(y))
 
 def rgb_to_hsv(tensor):
     r, g, b = tensor[:, 0], tensor[:, 1], tensor[:, 2]
@@ -58,7 +47,7 @@ def edge_loss(y_true, y_pred):
 
     return F.l1_loss(grad_true_x, grad_pred_x) + F.l1_loss(grad_true_y, grad_pred_y)
 
-def temporal_optical_flow_loss(prev_input, next_input, prev_output, next_output):
+def optical_flow_consistency(prev_input, next_input, prev_output, next_output):
     prev_np = prev_input.squeeze(0).permute(1, 2, 0).cpu().numpy()
     next_np = next_input.squeeze(0).permute(1, 2, 0).cpu().numpy()
     prev_gray = cv2.cvtColor((prev_np * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
@@ -79,6 +68,16 @@ def temporal_optical_flow_loss(prev_input, next_input, prev_output, next_output)
 
     return F.l1_loss(prev_output, warped_next_tensor)
 
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.model = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features[:16].to(device).eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+    def forward(self, x, y):
+        return F.mse_loss(self.model(x), self.model(y))
+
 class CombinedLoss(nn.Module):
     def __init__(self, device):
         super().__init__()
@@ -94,21 +93,22 @@ class CombinedLoss(nn.Module):
         }
 
     def forward(self, y_true_seq, y_pred_seq, x_input_seq=None):
-        loss = 0
-        for i in range(len(y_true_seq)):
-            loss += (
-                self.weights["smooth_l1"] * F.smooth_l1_loss(y_true_seq[i], y_pred_seq[i]) +
-                self.weights["perceptual"] * self.perceptual(y_true_seq[i], y_pred_seq[i]) +
-                self.weights["ms_ssim"] * (1 - ms_ssim(y_true_seq[i], y_pred_seq[i], data_range=1.0)) +
-                self.weights["hsv"] * hsv_color_loss(y_true_seq[i], y_pred_seq[i]) +
-                self.weights["tv"] * tv_loss(y_pred_seq[i]) +
-                self.weights["edge"] * edge_loss(y_true_seq[i], y_pred_seq[i])
-            )
+        y_true = y_true_seq[1]
+        y_pred = y_pred_seq[0]
 
-        if x_input_seq is not None and len(y_pred_seq) >= 3:
+        loss = (
+            self.weights["smooth_l1"] * F.smooth_l1_loss(y_true, y_pred) +
+            self.weights["perceptual"] * self.perceptual(y_true, y_pred) +
+            self.weights["ms_ssim"] * (1 - ms_ssim(y_true, y_pred, data_range=1.0)) +
+            self.weights["hsv"] * hsv_color_loss(y_true, y_pred) +
+            self.weights["tv"] * tv_loss(y_pred) +
+            self.weights["edge"] * edge_loss(y_true, y_pred)
+        )
+
+        if x_input_seq is not None and len(x_input_seq) >= 3:
             loss += self.weights["temporal"] * (
-                temporal_optical_flow_loss(x_input_seq[0], x_input_seq[1], y_pred_seq[0], y_pred_seq[1]) +
-                temporal_optical_flow_loss(x_input_seq[1], x_input_seq[2], y_pred_seq[1], y_pred_seq[2])
+                optical_flow_consistency(x_input_seq[0], x_input_seq[1], y_pred, y_pred) +
+                optical_flow_consistency(x_input_seq[1], x_input_seq[2], y_pred, y_pred)
             )
 
-        return loss / len(y_true_seq)
+        return loss
