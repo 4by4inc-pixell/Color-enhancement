@@ -92,17 +92,21 @@ class TemporalTestDataset(Dataset):
             'frame_name': frame
         }
 
-def create_dataloaders(train_low, train_high, test_low, crop_size=256, batch_size=1):
+def create_dataloaders(train_low, train_high, test_low=None, val_low=None, val_high=None,
+                       crop_size=256, batch_size=1):
     transform = transforms.Compose([transforms.ToTensor()])
-    train_loader = None
-    test_loader = None
+    train_loader = test_loader = val_loader = None
 
     if train_low and train_high:
         train_dataset = TemporalPairedDataset(train_low, train_high, transform=transform, crop_size=crop_size)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
+    if val_low and val_high:
+        val_dataset = TemporalPairedDataset(val_low, val_high, transform=transform, crop_size=crop_size)
+        val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=2)
+
     if test_low:
         test_dataset = TemporalTestDataset(test_low, transform=transform)
         test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2)
 
-    return train_loader, test_loader
+    return train_loader, test_loader, val_loader
