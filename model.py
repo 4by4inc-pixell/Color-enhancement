@@ -46,26 +46,69 @@ class MSEFBlock(nn.Module):
         else:
             return self._forward(x)
 
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** 0.5
-        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
-        self.proj = nn.Linear(embed_dim, embed_dim)
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(input_dim + hidden_dim, hidden_dim * 4, kernel_size, padding=padding)
+        self.hidden_dim = hidden_dim
+
+    def forward(self, x, h_prev, c_prev):
+        combined = torch.cat([x, h_prev], dim=1)
+        gates = self.conv(combined)
+        i, f, o, g = torch.chunk(gates, 4, dim=1)
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        o = torch.sigmoid(o)
+        g = torch.tanh(g)
+        c = f * c_prev + i * g
+        h = o * torch.tanh(c)
+        return h, c
+
+class ConvLSTMBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size=3):
+        super().__init__()
+        self.cell = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
 
     def forward(self, x):
-        b, c, h, w = x.shape
-        x = x.view(b, c, -1).permute(0, 2, 1)  
-        qkv = self.qkv(x).chunk(3, dim=-1)
-        q, k, v = [t.view(b, -1, self.num_heads, self.head_dim).transpose(1, 2) for t in qkv]
+        B, T, C, H, W = x.size()
+        h, c = (torch.zeros(B, C, H, W, device=x.device),
+                torch.zeros(B, C, H, W, device=x.device))
+        outputs = []
+        for t in range(T):
+            h, c = self.cell(x[:, t], h, c)
+            outputs.append(h)
+        return outputs[T // 2]
 
-        attn = (q @ k.transpose(-2, -1)) / self.scale
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(b, -1, self.num_heads * self.head_dim)
-        out = self.proj(out)
-        return out.permute(0, 2, 1).view(b, -1, h, w)
+class FeatureExtractor(nn.Module):
+    def __init__(self, filters):
+        super().__init__()
+        self.process_y = nn.Conv2d(1, filters, 3, padding=1)
+        self.process_cb = nn.Conv2d(1, filters, 3, padding=1)
+        self.process_cr = nn.Conv2d(1, filters, 3, padding=1)
+        self.denoise_cb = Denoiser(filters // 2)
+        self.denoise_cr = Denoiser(filters // 2)
+
+    def forward(self, x):
+        ycbcr = self._rgb_to_ycbcr(x)
+        y, cb, cr = ycbcr[:, 0:1], ycbcr[:, 1:2], ycbcr[:, 2:3]
+
+        cb = self.denoise_cb(cb) + cb
+        cr = self.denoise_cr(cr) + cr
+
+        y_feat = F.relu(self.process_y(y))
+        cb_feat = F.relu(self.process_cb(cb))
+        cr_feat = F.relu(self.process_cr(cr))
+        ref = torch.cat([cb_feat, cr_feat], dim=1)
+
+        return y_feat, ref
+
+    def _rgb_to_ycbcr(self, x):
+        r, g, b = x[:, 0], x[:, 1], x[:, 2]
+        y = 0.299 * r + 0.587 * g + 0.114 * b
+        cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 0.5
+        cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 0.5
+        return torch.stack([y, cb, cr], dim=1)
 
 class Denoiser(nn.Module):
     def __init__(self, channels):
@@ -91,63 +134,39 @@ class Denoiser(nn.Module):
         x3 = F.interpolate(x3, size=x.shape[-2:], mode='bilinear', align_corners=False)
         return torch.tanh(self.out_conv(x3))
 
-class ColEn(nn.Module):
+class FusionLYT(nn.Module):
     def __init__(self, filters=32):
         super().__init__()
-        self.process_y = nn.Conv2d(1, filters, 3, padding=1)
-        self.process_cb = nn.Conv2d(1, filters, 3, padding=1)
-        self.process_cr = nn.Conv2d(1, filters, 3, padding=1)
-
-        self.denoise_cb = Denoiser(filters // 2)
-        self.denoise_cr = Denoiser(filters // 2)
-
-        self.pool = lambda x: F.interpolate(x, size=(32, 32), mode='bilinear')
-        self.mhsa = MultiHeadSelfAttention(embed_dim=filters, num_heads=4)
-
-        self.lum_conv = nn.Conv2d(filters, filters, 1)
+        self.extractor = FeatureExtractor(filters)
+        self.lum_conv = nn.Conv2d(filters, filters * 2, 1)
         self.ref_conv = nn.Conv2d(filters * 2, filters, 1)
-        self.fuse = MSEFBlock(filters)
-        self.concat = nn.Conv2d(filters * 2, filters, 3, padding=1)
+        self.fuse = MSEFBlock(filters * 2)
+        self.concat = nn.Conv2d(filters * 3, filters, 3, padding=1)
         self.out_conv = nn.Conv2d(filters, 3, 3, padding=1)
 
-    def _rgb_to_ycbcr(self, x):
-        r, g, b = x[:, 0], x[:, 1], x[:, 2]
-        y = 0.299 * r + 0.587 * g + 0.114 * b
-        cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 0.5
-        cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 0.5
-        return torch.stack([y, cb, cr], dim=1)
+        self.temporal_conv_lstm_y = ConvLSTMBlock(filters, filters)
+        self.temporal_conv_lstm_ref = ConvLSTMBlock(filters * 2, filters * 2)
+
+        self.pool = lambda x: F.interpolate(x, size=(32, 32), mode='bilinear')
 
     def forward(self, x):
         x1, x2, x3 = torch.chunk(x, 3, dim=1)
-        
-        out1 = self._forward_single(x1)
-        out2 = self._forward_single(x2)
-        out3 = self._forward_single(x3)
-        
-        return [out1, out2, out3]
-    
-    def _forward_single(self, x):
-        residual = x
-        ycbcr = self._rgb_to_ycbcr(x)
-        y, cb, cr = ycbcr[:, 0:1], ycbcr[:, 1:2], ycbcr[:, 2:3]
+        y1, ref1 = self.extractor(x1)
+        y2, ref2 = self.extractor(x2)
+        y3, ref3 = self.extractor(x3)
 
-        cb = self.denoise_cb(cb) + cb
-        cr = self.denoise_cr(cr) + cr
+        y_seq = torch.stack([y1, y2, y3], dim=1)
+        ref_seq = torch.stack([ref1, ref2, ref3], dim=1)
 
-        y_feat = F.relu(self.process_y(y))
-        cb_feat = F.relu(self.process_cb(cb))
-        cr_feat = F.relu(self.process_cr(cr))
+        y_lstm = self.temporal_conv_lstm_y(y_seq)
+        ref_lstm = self.temporal_conv_lstm_ref(ref_seq)
 
-        ref = torch.cat([cb_feat, cr_feat], dim=1)
-        ref = self.ref_conv(ref)
+        context = self.pool(y_lstm)
+        context = F.interpolate(context, size=y_lstm.shape[2:], mode='bilinear', align_corners=False)
 
-        context = self.pool(y_feat)
-        context = self.mhsa(context)
-        context = F.interpolate(context, size=y_feat.shape[2:], mode='bilinear', align_corners=False)
-
-        ref = ref + 0.2 * self.lum_conv(context)
+        ref = ref_lstm + 0.2 * self.lum_conv(context)
         ref = self.fuse(ref)
-        fused = self.concat(torch.cat([ref, y_feat], dim=1))
-        output = torch.sigmoid(self.out_conv(fused) + residual)
+        fused = self.concat(torch.cat([ref, y_lstm], dim=1))
+        output = torch.sigmoid(self.out_conv(fused) + x2)
 
-        return output
+        return [output]
