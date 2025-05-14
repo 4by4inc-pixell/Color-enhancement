@@ -167,6 +167,6 @@ class FusionLYT(nn.Module):
         ref = ref_lstm + 0.2 * self.lum_conv(context)
         ref = self.fuse(ref)
         fused = self.concat(torch.cat([ref, y_lstm], dim=1))
-        output = torch.sigmoid(self.out_conv(fused) + x2)
+        output = torch.sigmoid(self.out_conv(fused))
 
         return [output]
