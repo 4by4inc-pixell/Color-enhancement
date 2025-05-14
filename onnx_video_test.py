@@ -18,7 +18,7 @@ def preprocess_frame(frame):
     return np.transpose(frame_rgb, (2, 0, 1))
 
 def tensor_to_cv_image(tensor):
-    tensor = np.clip(tensor, 0, 1) * 1.0
+    tensor = np.clip(tensor * 1.1, 0, 1)
     tensor = (tensor.transpose(1, 2, 0) * 255).astype(np.uint8)
     return cv2.cvtColor(tensor, cv2.COLOR_RGB2BGR)
 
