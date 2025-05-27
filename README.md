@@ -44,12 +44,12 @@ Run the following command for test:
 
 - Pytorch model test:
 ```bash
-python pytorch_video_test.py --input_video<input video path> --model_path<pytorch color-enhancement model> --output_folder<generated color enhance video path> 
+python pytorch_video_test.py --video_path<input video path> --model_path<pytorch color-enhancement model> --save_dir<generated color enhance video path> 
 ```
 
 - ONNX model test:
 ```bash
-python onnx_video_test.py --input_video<input video path> --model_path<onnx color-enhancement model> ---output_folder<generated color enhance video path> --gpus <gpu number to use(e.g., 0 1 2 3)>
+python onnx_video_test.py --video_path<input video path> --onnx_path<onnx color-enhancement model> ---save_dir<generated color enhance video path> 
 ```
 
 <!--
