@@ -52,6 +52,7 @@ python pytorch_video_test.py --input_video<input video path> --model_path<pytorc
 python onnx_video_test.py --input_video<input video path> --model_path<onnx color-enhancement model> ---output_folder<generated color enhance video path> --gpus <gpu number to use(e.g., 0 1 2 3)>
 ```
 
+<!--
 ## Quantitative evaluation
 
 
@@ -63,7 +64,7 @@ python onnx_video_test.py --input_video<input video path> --model_path<onnx colo
 |       Inference time         |  350~400 ms/frame | 575~625 ms/frame |
 
 </div>
-
+-->
 
 ## Qualitative evaluation
 
