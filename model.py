@@ -134,7 +134,7 @@ class Denoiser(nn.Module):
         x3 = F.interpolate(x3, size=x.shape[-2:], mode='bilinear', align_corners=False)
         return torch.tanh(self.out_conv(x3))
 
-class FusionLYT(nn.Module):
+class ColEn(nn.Module):
     def __init__(self, filters=32):
         super().__init__()
         self.extractor = FeatureExtractor(filters)
@@ -167,6 +167,7 @@ class FusionLYT(nn.Module):
         ref = ref_lstm + 0.2 * self.lum_conv(context)
         ref = self.fuse(ref)
         fused = self.concat(torch.cat([ref, y_lstm], dim=1))
-        output = torch.sigmoid(self.out_conv(fused))
-
+        output = self.out_conv(fused)
+        output = torch.sigmoid(output)
+        output = torch.clamp(output, 0, 1)
         return [output]
