@@ -30,6 +30,7 @@ pip install -r requirements.txt
 
 ```
 
+<!--
 ## Download Pre-trained Models
 
 Download pytorch models: [Pytorch model](https://drive.google.com/file/d/12kmIeep10ok5y0SRfWQsQjikMUfY2to6/view?usp=sharing).
@@ -37,6 +38,7 @@ Download pytorch models: [Pytorch model](https://drive.google.com/file/d/12kmIee
 
 
 Download onnx models: [ONNX model](https://drive.google.com/file/d/1VZJf6QmqvIm1DJEXWO6kBfSzgl73FpvF/view?usp=sharing).
+-->
 
 ## Test
 
