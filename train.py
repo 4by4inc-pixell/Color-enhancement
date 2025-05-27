@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchmetrics.functional import structural_similarity_index_measure
 from torch.utils.tensorboard import SummaryWriter
-from model import FusionLYT
+from model import ColEn
 from losses import CombinedLoss
 from dataloader import create_dataloaders
 import os
@@ -64,7 +64,7 @@ def main():
     }
 
     learning_rate = 2e-4
-    num_epochs = 1000
+    num_epochs = 500
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'LR: {learning_rate}, Epochs: {num_epochs}')
 
@@ -79,14 +79,14 @@ def main():
 
     print(f'Train loader: {len(train_loader)}, Val loader: {len(val_loader)}')
 
-    model = FusionLYT().to(device)
+    model = ColEn().to(device)
     criterion = CombinedLoss(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
     scaler = torch.amp.GradScaler()
 
     best_val_psnr = 0.0
-    writer = SummaryWriter(log_dir="logs/Fusion_Enhance")
+    writer = SummaryWriter(log_dir="logs/Color_Enhancement_0514_new")
     print('Training started.')
 
     for epoch in range(num_epochs):
@@ -130,7 +130,7 @@ def main():
 
         if val_psnr > best_val_psnr:
             best_val_psnr = val_psnr
-            save_path = f'saved_train_models/Fusion_Enhance/ColorEnhance_epoch{epoch + 1:04d}_valpsnr{best_val_psnr:.4f}.pth'
+            save_path = f'saved_train_models/Color_Enhancement_0514_new/ColorEnhance_epoch{epoch + 1:04d}_valpsnr{best_val_psnr:.4f}.pth'
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(model.state_dict(), save_path)
             print(f'Saving new best model at epoch {epoch + 1} with Val PSNR: {best_val_psnr:.4f}')
