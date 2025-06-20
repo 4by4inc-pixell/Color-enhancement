@@ -117,6 +117,10 @@ def worker_loop(frame_queue, result_queue, model_path, device_id, tile_size, ove
     session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
     providers = [
+        # ('TensorrtExecutionProvider', {
+        #     'trt_max_workspace_size': 1 << 30,
+        #     'trt_fp16_enable': True,
+        # }),
         ('CUDAExecutionProvider', {
             'arena_extend_strategy': 'kSameAsRequested',
             'gpu_mem_limit': 2 * 1024 * 1024 * 1024,
