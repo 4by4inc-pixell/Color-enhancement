@@ -112,3 +112,4 @@ class CombinedLoss(nn.Module):
             )
 
         return loss
+    
