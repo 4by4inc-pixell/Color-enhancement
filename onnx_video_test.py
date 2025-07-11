@@ -1,17 +1,18 @@
 import os
+import cv2
 import time
 import torch
-import numpy as np
 import argparse
-import onnxruntime as ort
+import numpy as np
+import torch.nn.functional as F
+from model import ColEn
+from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
-from threading import Thread
 from multiprocessing import Process, Queue
-import torchvision.transforms as transforms
-import cv2
+from threading import Thread
 
-def load_frames(video_path):
+def load_frames_from_video(video_path):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     frames = []
@@ -19,16 +20,26 @@ def load_frames(video_path):
         ret, frame = cap.read()
         if not ret:
             break
-        frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(Image.fromarray(rgb))
     cap.release()
     return frames, fps
 
 def pad_to_multiple(img, multiple=32):
-    w, h = img.size
+    h, w = img.size[1], img.size[0]
     new_h = ((h - 1) // multiple + 1) * multiple
     new_w = ((w - 1) // multiple + 1) * multiple
-    pad = (0, 0, new_w - w, new_h - h)
-    return transforms.functional.pad(img, pad, padding_mode='reflect'), pad
+    pad_right = new_w - w
+    pad_bottom = new_h - h
+    arr = np.array(img)
+    if pad_right > 0 or pad_bottom > 0:
+        arr = np.pad(
+            arr,
+            ((0, pad_bottom), (0, pad_right), (0, 0)),
+            mode='edge'  
+        )
+    img_padded = Image.fromarray(arr)
+    return img_padded, (0, 0, pad_right, pad_bottom)
 
 def create_weight_mask(tile_size, device):
     y = np.linspace(-1, 1, tile_size)
@@ -36,53 +47,17 @@ def create_weight_mask(tile_size, device):
     xv, yv = np.meshgrid(x, y)
     dist = np.sqrt(xv**2 + yv**2)
     sigma = 0.3
-    weights = np.exp(-0.5 * (dist / sigma)**2).astype(np.float32)
-    return torch.from_numpy(weights / weights.max()).unsqueeze(0).unsqueeze(0).to(device)
+    weights = np.exp(-0.5 * (dist / sigma) ** 2).astype(np.float32)
+    weights = weights / weights.max()
+    weights = torch.from_numpy(weights).unsqueeze(0).unsqueeze(0).to(device)
+    return weights
 
-def safe_pad(tensor, pad_w, pad_h):
-    b, c, h, w = tensor.shape
-    out = tensor
-    if pad_w > 0:
-        last_col = out[..., :, w-1].unsqueeze(-1)  
-        fill_w = last_col.repeat(1, 1, 1, pad_w)
-        out = torch.cat([out, fill_w], dim=-1)
-    if pad_h > 0:
-        new_w = out.shape[-1]
-        last_row = out[..., h-1:h, :].repeat(1, 1, pad_h, 1)
-        out = torch.cat([out, last_row], dim=-2)
-    return out
-
-def safe_onnx_infer(session, input_tensor, device):
-    io_binding = session.io_binding()
-    inp_name = session.get_inputs()[0].name
-    out_name = session.get_outputs()[0].name
-    tensor = input_tensor.contiguous()
-    io_binding.bind_input(
-        name=inp_name,
-        device_type='cuda',
-        device_id=device.index,
-        element_type=np.float32,
-        shape=tensor.shape,
-        buffer_ptr=tensor.data_ptr()
-    )
-    output = torch.empty((1, 3, tensor.shape[-2], tensor.shape[-1]), dtype=torch.float32, device=device)
-    io_binding.bind_output(
-        name=out_name,
-        device_type='cuda',
-        device_id=device.index,
-        element_type=np.float32,
-        shape=output.shape,
-        buffer_ptr=output.data_ptr()
-    )
-    session.run_with_iobinding(io_binding)
-    return output
-
-def tile_forward_onnx(session, imgs, tile_size, overlap, device):
+def tile_forward(model, imgs, device, tile_size=512, overlap=256):
     b, t, c, h, w = imgs.shape
     stride = tile_size - overlap
     out = torch.zeros((b, 3, h, w), device=device)
     weight = torch.zeros((b, 1, h, w), device=device)
-    wm_base = create_weight_mask(tile_size, device)
+    weight_mask = create_weight_mask(tile_size, device)
 
     for y in range(0, h, stride):
         for x in range(0, w, stride):
@@ -92,18 +67,24 @@ def tile_forward_onnx(session, imgs, tile_size, overlap, device):
             pad_h = tile_size - (y2 - y1)
             pad_w = tile_size - (x2 - x1)
 
-            patches, masks = [], []
+            patch_list = []
+            wm_list = []
             for ti in range(t):
-                pt = safe_pad(patch[:, ti].to(device), pad_w, pad_h)
-                wm = torch.nn.functional.pad(wm_base, (0, pad_w, 0, pad_h), mode='constant', value=0)
-                patches.append(pt)
-                masks.append(wm)
+                patch_t = patch[:, ti]
+                wm_t = weight_mask
+                patch_t = F.pad(patch_t, (0, pad_w, 0, pad_h), mode='replicate')
+                wm_t = F.pad(wm_t, (0, pad_w, 0, pad_h), mode='replicate')
+                patch_list.append(patch_t)
+                wm_list.append(wm_t)
 
-            inp = torch.cat(patches, dim=1)
-            wm_mean = torch.stack(masks, dim=0).mean(dim=0)
-            out_patch = safe_onnx_infer(session, inp, device)
-            out_patch = out_patch[:, :, :y2-y1, :x2-x1]
-            wm = wm_mean[:, :, :y2-y1, :x2-x1]
+            patch = torch.cat(patch_list, dim=1)
+            wm = torch.stack(wm_list, dim=0).mean(dim=0)
+
+            with torch.no_grad(), torch.amp.autocast(device_type='cuda'):
+                out_patch = model(patch)[0]
+
+            out_patch = out_patch[:, :, :y2 - y1, :x2 - x1]
+            wm = wm[:, :, :y2 - y1, :x2 - x1]
 
             out[:, :, y1:y2, x1:x2] += out_patch * wm
             weight[:, :, y1:y2, x1:x2] += wm
@@ -111,103 +92,109 @@ def tile_forward_onnx(session, imgs, tile_size, overlap, device):
     return out / (weight + 1e-8)
 
 def worker_loop(frame_queue, result_queue, model_path, device_id, tile_size, overlap, frames):
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(device_id)
-    torch.cuda.set_device(0)
-    device = torch.device('cuda:0')
+    torch.cuda.set_device(device_id)
+    device = torch.device(f'cuda:{device_id}')
+    model = ColEn(filters=16).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.eval()
     transform = transforms.ToTensor()
 
-    sess_opts = ort.SessionOptions()
-    sess_opts.enable_mem_pattern = False
-    sess_opts.intra_op_num_threads = 1
-    sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    providers = [
-        ('CUDAExecutionProvider', {
-            'arena_extend_strategy': 'kSameAsRequested',
-            'gpu_mem_limit': 2 << 30,
-            'cudnn_conv_algo_search': 'DEFAULT',
-            'do_copy_in_default_stream': True
-        }), 'CPUExecutionProvider'
-    ]
-    session = ort.InferenceSession(model_path, sess_options=sess_opts, providers=providers)
-
     while True:
-        indices = frame_queue.get()
-        if indices is None:
+        idx = frame_queue.get()
+        if idx is None:
             break
-        results = []
-        for i in indices:
-            idxs = [max(0,i-1), i, min(len(frames)-1, i+1)]
-            imgs = [transform(pad_to_multiple(frames[j])[0]) for j in idxs]
-            inp = torch.stack(imgs, dim=0).unsqueeze(0).to(device)
-            out = tile_forward_onnx(session, inp, tile_size, overlap, device)
-            h, w = frames[i].size[1], frames[i].size[0]
-            img_np = (out[:, :, :h, :w].squeeze().permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
-            results.append((i, img_np))
-        for r in results:
-            result_queue.put(r)
+        idxs = [max(0, idx - 1), idx, min(len(frames) - 1, idx + 1)]
+        imgs = [frames[j] for j in idxs]
+        padded_imgs = [transform(pad_to_multiple(img)[0]) for img in imgs]
+        input_tensor = torch.stack(padded_imgs, dim=0).unsqueeze(0).to(device)
+
+        output = tile_forward(model, input_tensor, device, tile_size, overlap)
+        unpadded_output = output[:, :, :frames[idx].size[1], :frames[idx].size[0]]
+        result = unpadded_output.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        result = (result * 255).clip(0, 255).astype(np.uint8)
+        result_queue.put((idx, result))
 
 def frame_writer(result_queue, total_frames, save_path, fps, frame_size, pbar_queue):
     h, w = frame_size
-    writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-    cache, idx = {}, 0
-    while idx < total_frames:
-        if idx in cache:
-            writer.write(cv2.cvtColor(cache.pop(idx), cv2.COLOR_RGB2BGR))
+    out = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+    cache = {}
+    current_idx = 0
+    while current_idx < total_frames:
+        if current_idx in cache:
+            frame = cache.pop(current_idx)
+            out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             pbar_queue.put(1)
-            idx += 1
+            current_idx += 1
         else:
             i, frame = result_queue.get()
-            if i == idx:
-                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            if i == current_idx:
+                out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                 pbar_queue.put(1)
-                idx += 1
+                current_idx += 1
             else:
                 cache[i] = frame
-    writer.release()
+    out.release()
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--video_path', required=True)
-    parser.add_argument('--onnx_path', required=True)
+    parser.add_argument('--model_path', required=True)
     parser.add_argument('--save_dir', required=True)
-    parser.add_argument('--batch_size', type=int, default=1)
     args = parser.parse_args()
 
-    frames, fps = load_frames(args.video_path)
-    h, w = frames[0].size[1], frames[0].size[0]
+    frames, fps = load_frames_from_video(args.video_path)
+    height, width = frames[0].size[1], frames[0].size[0]
     tile_size = 512
     overlap = 256
 
+    input_name = os.path.splitext(os.path.basename(args.video_path))[0]
+    ext = os.path.splitext(args.video_path)[1].lstrip('.')
+    save_name = f'Enhanced_{input_name}.{ext}'
     os.makedirs(args.save_dir, exist_ok=True)
-    save_path = os.path.join(args.save_dir, f"ONNX_Enhanced_{os.path.basename(args.video_path)}")
+    save_path = os.path.join(args.save_dir, save_name)
+
     total_frames = len(frames)
     num_gpus = torch.cuda.device_count()
-    print(f"GPUs: {num_gpus}, tile={tile_size}, overlap={overlap}")
 
-    frame_queue, result_queue, pbar_queue = Queue(), Queue(), Queue()
+    frame_queue = Queue()
+    result_queue = Queue()
+    pbar_queue = Queue()
 
-    tqdm_thread = Thread(target=lambda: [pbar_queue.get() for _ in tqdm(range(total_frames), desc="Inference", ncols=100)])
+    def tqdm_updater(total, queue):
+        with tqdm(total=total, desc="Enhancing video", ncols=100) as pbar:
+            for _ in range(total):
+                queue.get()
+                pbar.update(1)
+
+    tqdm_thread = Thread(target=tqdm_updater, args=(total_frames, pbar_queue))
+    writer_thread = Thread(target=frame_writer, args=(result_queue, total_frames, save_path, fps, (height, width), pbar_queue))
+
+    start_time = time.time()
     tqdm_thread.start()
-
-    writer_thread = Thread(target=frame_writer, args=(result_queue, total_frames, save_path, fps, (h, w), pbar_queue))
     writer_thread.start()
 
+    for i in range(total_frames):
+        frame_queue.put(i)
+    for _ in range(num_gpus):
+        frame_queue.put(None)
+
     workers = []
-    for d in range(num_gpus):
-        p = Process(target=worker_loop, args=(frame_queue, result_queue, args.onnx_path, d, tile_size, overlap, frames))
-        p.start(); workers.append(p)
+    for device_id in range(num_gpus):
+        p = Process(target=worker_loop, args=(frame_queue, result_queue, args.model_path, device_id, tile_size, overlap, frames))
+        p.start()
+        workers.append(p)
 
-    start_time = time.time()  
-    for i in range(0, total_frames, args.batch_size):
-        frame_queue.put(list(range(i, min(i+args.batch_size, total_frames))))
-    for _ in range(num_gpus): frame_queue.put(None)
+    for p in workers:
+        p.join()
+    writer_thread.join()
+    tqdm_thread.join()
 
-    for p in workers: p.join()
-    writer_thread.join(); tqdm_thread.join()
-    end_time = time.time()  
-    elapsed = end_time - start_time
-    print(f"Total inference time: {elapsed:.2f} seconds")
-    overall_fps = total_frames / elapsed if elapsed > 0 else float('inf')
-    print(f"FPS: {overall_fps:.2f} frames/sec")
-    print(f"Saved: {save_path}")
+    total_time = time.time() - start_time
+    fps_out = total_frames / total_time
 
+    print(f"\nEnhanced video saved to: {save_path}")
+    print(f"Total inference time: {total_time:.2f} seconds")
+    print(f"FPS: {fps_out:.2f} frames/sec")
+
+if __name__ == "__main__":
+    main()
