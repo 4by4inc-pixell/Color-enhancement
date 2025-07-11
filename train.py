@@ -64,7 +64,7 @@ def main():
     }
 
     learning_rate = 2e-4
-    num_epochs = 500
+    num_epochs = 1000
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'LR: {learning_rate}, Epochs: {num_epochs}')
 
@@ -86,7 +86,7 @@ def main():
     scaler = torch.amp.GradScaler()
 
     best_val_psnr = 0.0
-    writer = SummaryWriter(log_dir="logs/Color_Enhancement")
+    writer = SummaryWriter(log_dir="logs/Color_Enhancement_0710")
     print('Training started.')
 
     for epoch in range(num_epochs):
@@ -130,7 +130,7 @@ def main():
 
         if val_psnr > best_val_psnr:
             best_val_psnr = val_psnr
-            save_path = f'saved_train_models/Color_Enhancement_0514/ColorEnhance_epoch{epoch + 1:04d}_valpsnr{best_val_psnr:.4f}.pth'
+            save_path = f'saved_train_models/Color_Enhancement_0710/ColorEnhance_epoch{epoch + 1:04d}_valpsnr{best_val_psnr:.4f}.pth'
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save(model.state_dict(), save_path)
             print(f'Saving new best model at epoch {epoch + 1} with Val PSNR: {best_val_psnr:.4f}')
