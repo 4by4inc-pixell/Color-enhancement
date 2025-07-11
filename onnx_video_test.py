@@ -197,10 +197,17 @@ if __name__ == '__main__':
         p = Process(target=worker_loop, args=(frame_queue, result_queue, args.onnx_path, d, tile_size, overlap, frames))
         p.start(); workers.append(p)
 
+    start_time = time.time()  
     for i in range(0, total_frames, args.batch_size):
         frame_queue.put(list(range(i, min(i+args.batch_size, total_frames))))
     for _ in range(num_gpus): frame_queue.put(None)
 
     for p in workers: p.join()
     writer_thread.join(); tqdm_thread.join()
+    end_time = time.time()  
+    elapsed = end_time - start_time
+    print(f"Total inference time: {elapsed:.2f} seconds")
+    overall_fps = total_frames / elapsed if elapsed > 0 else float('inf')
+    print(f"FPS: {overall_fps:.2f} frames/sec")
     print(f"Saved: {save_path}")
+
