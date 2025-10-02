@@ -384,7 +384,7 @@ def main():
     parser.add_argument("--onnx_step", required=True) 
 
     parser.add_argument("--tile_size", type=int, default=512)
-    parser.add_argument("--tile_overlap", type=int, default=64) 
+    parser.add_argument("--tile_overlap", type=int, default=128) 
     parser.add_argument("--tile_batch", type=int, default=8) 
 
     parser.add_argument("--no_harmonize", action="store_true")
