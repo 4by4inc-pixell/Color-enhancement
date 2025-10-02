@@ -1,13 +1,5 @@
 # Color-enhancement
 
-## Overview
-Color enhancement aims to improve the visual quality of images and videos by restoring or enhancing color information. 
-This process seeks to refine sharpness, saturation, and overall color balance, producing more natural and visually appealing results. 
-To address this task, we'd like to propose a model that operates by first transforming RGB inputs into the YCbCr color space. 
-The chrominance components (Cb and Cr) are individually denoised, while spatial feature extraction blocks and a global attention mechanism are employed to enhance the luminance component (Y). 
-The model processes triplet frames to promote temporal consistency, and it is trained using a comprehensive set of loss functions, including perceptual loss, MS-SSIM loss, HSV color loss, edge loss, and optical flow-based temporal loss.
-Furthermore, the system is compatible with both PyTorch and ONNX frameworks and supports efficient multi-GPU inference pipelines, making it suitable for large-scale deployment.
-
 ## Requirements
 - CUDA 11.8
 - CUDNN 8.9
