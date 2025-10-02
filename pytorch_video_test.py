@@ -5,13 +5,13 @@ import time
 from typing import List, Tuple, Optional, Dict
 import torch
 from PIL import Image
-import torchvision.transforms as T
 import numpy as np
 import cv2
 from tqdm import tqdm
 import multiprocessing as mp
 from model import RetinexEnhancer
 import torch.nn.functional as F
+
 
 def _safe_load_state(path, device):
     obj = torch.load(path, map_location=device, weights_only=False)
@@ -49,7 +49,7 @@ def _remap_legacy_keys(sd):
         out[nk] = v
     return out
 
-def ensure_registered_buffers(model: RetinexEnhancer):
+def ensure_registered_buffers(model: 'RetinexEnhancer'):
     if not hasattr(model, "net"):
         return model
     net = model.net
@@ -78,7 +78,7 @@ def ensure_registered_buffers(model: RetinexEnhancer):
 def load_compat_ckpt(model, ckpt_path, device,
                      base_gain=1.15, base_lift=0.07,
                      base_chroma=None, midtone_sat=None,
-                     sat_mid_sigma=0.28,                    
+                     sat_mid_sigma=0.28,
                      skin_protect_strength=None,
                      highlight_knee=None, highlight_soft=None):
     state = _safe_load_state(ckpt_path, device)
@@ -115,9 +115,9 @@ def load_compat_ckpt(model, ckpt_path, device,
         "net.skin_protect_strength_buf",
         "net.highlight_knee_buf",
         "net.highlight_soft_buf",
-        "net.sat_mid_sigma_buf",            
-        "net.sat_mid_strength_buf",         
-        "net.base_chroma_buf",              
+        "net.sat_mid_sigma_buf",
+        "net.sat_mid_strength_buf",
+        "net.base_chroma_buf",
         "net.base_gain_buf",
         "net.base_lift_buf",
     }
@@ -157,7 +157,6 @@ class SceneResetter:
     def is_scene_change(self, frame_bgr: np.ndarray) -> bool:
         y_small = self._y_small(frame_bgr)
         hist = self._hsv_hist(frame_bgr)
-
         cut = False
         if self.prev_y_small is not None:
             mae = float(np.mean(np.abs(y_small - self.prev_y_small)))
@@ -168,7 +167,6 @@ class SceneResetter:
             corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
             if corr < self.bincorr_thresh:
                 cut = True
-
         self.prev_y_small = y_small
         self.prev_hist = hist
         return cut
@@ -177,136 +175,267 @@ class SceneResetter:
         self.prev_y_small = None
         self.prev_hist = None
 
-def _rgb_to_ycbcr(x: torch.Tensor) -> torch.Tensor:
-    r, g, b = x[:,0:1], x[:,1:2], x[:,2:3]
-    y  = 0.299*r + 0.587*g + 0.114*b
-    cb = 0.564*(b - y) + 0.5
-    cr = 0.713*(r - y) + 0.5
-    return torch.cat([y, cb, cr], dim=1)
-
-def _ycbcr_to_rgb(ycbcr: torch.Tensor) -> torch.Tensor:
-    y, cb, cr = ycbcr[:,0:1], ycbcr[:,1:2], ycbcr[:,2:3]
-    r = y + 1.403*(cr - 0.5)
-    g = y - 0.714*(cr - 0.5) - 0.344*(cb - 0.5)
-    b = y + 1.773*(cb - 0.5)
-    return torch.clamp(torch.cat([r, g, b], dim=1), 0.0, 1.0)
-
-def _smoothstep(t: torch.Tensor) -> torch.Tensor:
-    return t*t*(3.0 - 2.0*t)
-
-def post_tone_expand_rgb(rgb: torch.Tensor,
-                         low_pct=0.005, high_pct=0.995,
-                         hi_strength=0.55, hi_pct=0.997,
-                         do_black=True) -> torch.Tensor:
-    B, C, H, W = rgb.shape
-    ycc = _rgb_to_ycbcr(rgb)
-    Y, Cc = ycc[:,0:1], ycc[:,1:2]
-
-    Yd = F.avg_pool2d(Y, 8, 8) if min(H,W) >= 16 else Y
-    ql = torch.quantile(Yd.view(B, -1), low_pct,  dim=1).view(B,1,1,1) if do_black else torch.zeros_like(Y[:, :1, :1, :1])
-    qh = torch.quantile(Yd.view(B, -1), high_pct, dim=1).view(B,1,1,1)
-    eps = 1e-6
-    Ys = ((Y - ql) / (qh - ql + eps)).clamp(0,1)
-
-    qh2 = torch.quantile(Ys.view(B, -1), hi_pct, dim=1).view(B,1,1,1)
-    t = ((Ys - qh2) / (1.0 - qh2 + eps)).clamp(0,1)
-    t = _smoothstep(t)
+def _post_tone_expand_rgb_np(rgb, low_pct=0.005, high_pct=0.995, hi_strength=0.55, hi_pct=0.997, do_black=True):
+    r = rgb[:,:,0].astype(np.float32)/255.0
+    g = rgb[:,:,1].astype(np.float32)/255.0
+    b = rgb[:,:,2].astype(np.float32)/255.0
+    Y = 0.299*r + 0.587*g + 0.114*b
+    H, W = Y.shape
+    if min(H, W) >= 16:
+        Yd = cv2.resize(Y, (max(1, W//8), max(1, H//8)), interpolation=cv2.INTER_AREA)
+    else:
+        Yd = Y
+    ql = np.quantile(Yd.reshape(-1), low_pct) if do_black else 0.0
+    qh = np.quantile(Yd.reshape(-1), high_pct)
+    span = max(qh - ql, 1e-6)
+    Ys = np.clip((Y - ql) / span, 0.0, 1.0)
+    qh2 = np.quantile(Ys.reshape(-1), hi_pct)
+    t = np.clip((Ys - qh2) / max(1.0 - qh2, 1e-6), 0.0, 1.0)
+    t = t*t*(3.0 - 2.0*t)
     Y_boost = Ys + (1.0 - Ys) * t
     Y_out = Ys*(1.0 - hi_strength) + Y_boost*hi_strength
+    Cb = 0.564*(b - Y) + 0.5
+    Cr = 0.713*(r - Y) + 0.5
+    r2 = Y_out + 1.403*(Cr - 0.5)
+    g2 = Y_out - 0.714*(Cr - 0.5) - 0.344*(Cb - 0.5)
+    b2 = Y_out + 1.773*(Cb - 0.5)
+    out = np.stack([r2, g2, b2], axis=2)
+    out = np.clip(out, 0.0, 1.0)
+    out = (out*255.0 + 0.5).astype(np.uint8)
+    return out
 
-    out = torch.cat([Y_out, Cc], dim=1)
-    return _ycbcr_to_rgb(out)
+def _hann2d(h: int, w: int):
+    wx = np.hanning(max(2, w))
+    wy = np.hanning(max(2, h))
+    win = np.outer(wy, wx).astype(np.float32)
+    win = np.clip(win, 1e-4, 1.0)
+    return win
+
+def _pad_to_stride_rgb(img_rgb: np.ndarray, stride: int = 8) -> Tuple[np.ndarray, Tuple[int, int]]:
+    h, w = img_rgb.shape[:2]
+    pad_h = (stride - (h % stride)) % stride
+    pad_w = (stride - (w % stride)) % stride
+    if pad_h == 0 and pad_w == 0:
+        return img_rgb, (0, 0)
+    out = cv2.copyMakeBorder(img_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101)
+    return out, (pad_h, pad_w)
+
+def _ensure_even_for_writer(img_bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
+    h, w = img_bgr.shape[:2]
+    pad_h = (2 - (h % 2)) % 2
+    pad_w = (2 - (w % 2)) % 2
+    if pad_h == 0 and pad_w == 0:
+        return img_bgr, (0, 0)
+    out = cv2.copyMakeBorder(img_bgr, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    return out, (pad_h, pad_w)
+
+def _gen_starts(size: int, tile: int, stride: int) -> List[int]:
+    if size <= tile:
+        return [0]
+    starts = list(range(0, size - tile + 1, stride))
+    last = size - tile
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+def _extract_tiles(image_f32: np.ndarray, tile: int, overlap: int) -> Tuple[List[Tuple[int,int]], List[np.ndarray], Tuple[int,int]]:
+    H, W, _ = image_f32.shape
+    stride = max(1, tile - overlap)
+    Hp = max(H, tile)
+    Wp = max(W, tile)
+    if (Hp, Wp) != (H, W):
+        img_pad = cv2.copyMakeBorder(image_f32, 0, Hp - H, 0, Wp - W, cv2.BORDER_REPLICATE)
+    else:
+        img_pad = image_f32
+
+    ys = _gen_starts(Hp, tile, stride)
+    xs = _gen_starts(Wp, tile, stride)
+
+    coords, tiles = [], []
+    for y in ys:
+        for x in xs:
+            patch = img_pad[y:y+tile, x:x+tile, :]
+            coords.append((y, x))
+            tiles.append(patch)
+    return coords, tiles, (Hp, Wp)
+
+def _merge_tiles(coords, tiles_out, Hp, Wp, tile, overlap) -> np.ndarray:
+    acc = np.zeros((Hp, Wp, 3), dtype=np.float32)
+    wsum = np.zeros((Hp, Wp, 1), dtype=np.float32)
+    win = _hann2d(tile, tile)[:, :, None]
+
+    for (y, x), tout in zip(coords, tiles_out):
+        h, w, _ = tout.shape
+        acc[y:y+h, x:x+w, :] += tout * win[:h, :w, :]
+        wsum[y:y+h, x:x+w, :] += win[:h, :w, :]
+
+    out = acc / np.clip(wsum, 1e-6, None)
+    out = np.clip(out, 0.0, 1.0)
+    return out
+
+def _mean_std(x: np.ndarray):
+    m = x.reshape(-1, 3).mean(axis=0)
+    s = x.reshape(-1, 3).std(axis=0) + 1e-6
+    return m, s
+
+def _harmonize_tile(tile_out: np.ndarray, guide_patch: np.ndarray) -> np.ndarray:
+    m_o, s_o = _mean_std(tile_out)
+    m_g, s_g = _mean_std(guide_patch)
+    aligned = (tile_out - m_o) * (s_g / s_o) + m_g
+    return np.clip(aligned, 0.0, 1.0)
 
 @torch.inference_mode()
-def enhance_frame(model, device, frame_bgr, work_size, reset_state=False, post_cfg: Optional[Dict]=None):
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(frame_rgb, mode="RGB")
-    bicubic = _get_resample_bicubic()
-    w, h = pil.size
-    new_w, new_h = work_size
-    pil_rs = pil.resize((new_w, new_h), bicubic) if (w, h) != (new_w, new_h) else pil
-
-    to_tensor = T.ToTensor()
-    x = to_tensor(pil_rs).unsqueeze(0).to(device).to(memory_format=torch.channels_last)
-
+def _run_model_batch(model, device, xb: torch.Tensor) -> torch.Tensor:
+    """
+    xb: [B,3,H,W] float32 in [0,1]
+    Returns yb: [B,3,H,W] float32 in [0,1]
+    """
     model.eval()
     use_amp = (device.type == "cuda")
     from torch.amp import autocast
     with autocast(device_type=device.type, enabled=use_amp):
-        prev_state = None if reset_state else getattr(model, "_vid_state", None)
-        y, _, model._vid_state = model(x, None, prev_state, reset_state=reset_state)
+        y, _, _ = model(xb.to(device, memory_format=torch.channels_last), None, None, reset_state=True)
         y = y.clamp(0, 1)
+    return y
 
-        if post_cfg and post_cfg.get("enable", False):
-            y = post_tone_expand_rgb(
-                y,
-                low_pct=post_cfg.get("low_pct", 0.005),
-                high_pct=post_cfg.get("high_pct", 0.995),
-                hi_strength=post_cfg.get("hi_strength", 0.55),
-                hi_pct=post_cfg.get("hi_pct", 0.997),
-                do_black=post_cfg.get("do_black", True),
-            ).clamp(0,1)
+def _from_torch_to_uint8(yb: torch.Tensor) -> np.ndarray:
+    yb = yb.detach().cpu().clamp(0,1)
+    yb = (yb * 255.0 + 0.5).to(torch.uint8)
+    yb = yb.permute(0, 2, 3, 1).contiguous().numpy()  
+    return yb
 
-    y_np = y.squeeze(0).cpu().permute(1, 2, 0).numpy()
-    out_full = (y_np * 255.0 + 0.5).astype(np.uint8)
-    if (new_w, new_h) != (w, h):
-        out_resized = cv2.resize(out_full, (w, h), interpolation=cv2.INTER_CUBIC)
-    else:
-        out_resized = out_full
-    return out_resized
+@torch.inference_mode()
+def enhance_frame_tiled(model,
+                        device,
+                        frame_bgr: np.ndarray,
+                        tile: int = 512,
+                        overlap: int = 128,
+                        tile_batch: int = 8,
+                        harmonize: bool = True,
+                        guide_long: int = 256,
+                        post_cfg: Optional[Dict] = None) -> np.ndarray:
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    padded_rgb, (pad_h, pad_w) = _pad_to_stride_rgb(frame_rgb, stride=8)
+    im = padded_rgb.astype(np.float32) / 255.0
+    H_pad, W_pad, _ = im.shape
+    H_org, W_org = frame_rgb.shape[:2]
+
+    guide = None
+    if harmonize:
+        if max(H_pad, W_pad) > guide_long:
+            scale = guide_long / max(H_pad, W_pad)
+            gH, gW = int(round(H_pad * scale)), int(round(W_pad * scale))
+        else:
+            gH, gW = H_pad, W_pad
+        gH8 = _nearest_multiple_of(gH, 8)
+        gW8 = _nearest_multiple_of(gW, 8)
+        xg = cv2.resize(im, (gW8, gH8), interpolation=cv2.INTER_AREA)
+        xg_t = torch.from_numpy(np.transpose(xg, (2,0,1))[None]).float()  
+        yg = _run_model_batch(model, device, xg_t)  
+        yg_np = _from_torch_to_uint8(yg)[0]  
+        yg_np = cv2.resize(yg_np, (W_pad, H_pad), interpolation=cv2.INTER_CUBIC)
+        guide = yg_np.astype(np.float32) / 255.0
+
+    coords, tiles, (Hp, Wp) = _extract_tiles(im, tile=tile, overlap=overlap)
+
+    tiles_out: List[np.ndarray] = []
+    for i in range(0, len(tiles), tile_batch):
+        batch = tiles[i:i + tile_batch]
+        xb = np.stack([np.transpose(p, (2, 0, 1)) for p in batch], axis=0).astype(np.float32)  
+        xb_t = torch.from_numpy(xb)
+        yb = _run_model_batch(model, device, xb_t)  
+        yb_np = _from_torch_to_uint8(yb)  
+        for k in range(yb_np.shape[0]):
+            tiles_out.append(yb_np[k].astype(np.float32) / 255.0)
+
+    if harmonize and guide is not None:
+        g_tiles = []
+        for (y, x) in coords:
+            gy2 = min(y + tile, guide.shape[0])
+            gx2 = min(x + tile, guide.shape[1])
+            gp = guide[y:gy2, x:gx2, :]
+            if gp.shape[0] < tile or gp.shape[1] < tile:
+                gp = cv2.copyMakeBorder(
+                    gp,
+                    0, tile - gp.shape[0] if gp.shape[0] < tile else 0,
+                    0, tile - gp.shape[1] if gp.shape[1] < tile else 0,
+                    cv2.BORDER_REPLICATE
+                )
+            g_tiles.append(gp.astype(np.float32))
+        for idx in range(len(tiles_out)):
+            tiles_out[idx] = _harmonize_tile(tiles_out[idx], g_tiles[idx])
+
+    merged = _merge_tiles(coords, tiles_out, Hp, Wp, tile=tile, overlap=overlap)
+    merged = merged[:H_org, :W_org, :]
+    out_rgb = (np.clip(merged, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+    if post_cfg and post_cfg.get("enable", False):
+        out_rgb = _post_tone_expand_rgb_np(
+            out_rgb,
+            low_pct=post_cfg.get("low_pct", 0.005),
+            high_pct=post_cfg.get("high_pct", 0.995),
+            hi_strength=post_cfg.get("hi_strength", 0.55),
+            hi_pct=post_cfg.get("hi_pct", 0.997),
+            do_black=post_cfg.get("do_black", True),
+        )
+
+    return out_rgb
 
 def _open_video_writer(out_path: Path, fps, w, h):
+    writer_w = w + (w % 2)
+    writer_h = h + (h % 2)
     fourcc_list = ["mp4v", "avc1", "H264", "XVID", "MJPG"]
     for fcc in fourcc_list:
         four = cv2.VideoWriter_fourcc(*fcc)
-        vw = cv2.VideoWriter(str(out_path), four, fps, (w, h))
+        vw = cv2.VideoWriter(str(out_path), four, fps, (writer_w, writer_h))
         if vw.isOpened():
-            print(f"[Writer] Using fourcc={fcc} fps={fps:.3f} size=({w}x{h}) → {out_path.name}")
-            return vw
+            note = ""
+            if (writer_w, writer_h) != (w, h):
+                note = f" (opened as even {writer_w}x{writer_h})"
+            print(f"[Writer] Using fourcc={fcc} fps={fps:.3f} size=({w}x{h}){note} → {out_path.name}")
+            return vw, (writer_w, writer_h)
         else:
             vw.release()
     fallback = out_path.with_suffix(".avi")
     four = cv2.VideoWriter_fourcc(*"MJPG")
-    vw = cv2.VideoWriter(str(fallback), four, fps, (w, h))
+    vw = cv2.VideoWriter(str(fallback), four, fps, (writer_w, writer_h))
     if vw.isOpened():
         print(f"[Writer] Fallback MJPG → {fallback.name}")
-        return vw
-    return None
+        return vw, (writer_w, writer_h)
+    return None, (writer_w, writer_h)
 
-def _process_video_loop(model, device, cap, vw, work_w, work_h,
-                        frame_count, src_name,
-                        resetter: Optional[SceneResetter],
-                        periodic_reset: int,
-                        disable_temporal: bool,
-                        log_every: int,
-                        show_tqdm: bool,
-                        post_cfg: Optional[Dict]):
-    if hasattr(model, "_vid_state"):
-        delattr(model, "_vid_state")
-    model._vid_state = None
-
-    pbar = tqdm(total=frame_count, desc=f"Processing {src_name}", unit="frame",
-                disable=not show_tqdm or frame_count<=0)
+def _process_video_loop_tiled(model,
+                              device,
+                              cap,
+                              vw,
+                              writer_size: Tuple[int,int],
+                              frame_count: int,
+                              src_name: str,
+                              log_every: int,
+                              show_tqdm: bool,
+                              tile: int,
+                              overlap: int,
+                              tile_batch: int,
+                              guide_long: int,
+                              harmonize: bool,
+                              post_cfg: Optional[Dict]):
     processed = 0
     t0 = time.time()
-
+    Ww, Hw = writer_size
+    pbar = tqdm(total=frame_count, desc=f"Processing {src_name}", unit="frame",
+                disable=not show_tqdm or frame_count<=0)
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
             break
-
-        reset_flag = False
-        if disable_temporal:
-            reset_flag = True
-        else:
-            if resetter is not None and resetter.is_scene_change(frame_bgr):
-                reset_flag = True
-            if periodic_reset > 0 and processed > 0 and (processed % periodic_reset == 0):
-                reset_flag = True
-
-        out_rgb = enhance_frame(model, device, frame_bgr, (work_w, work_h),
-                                reset_state=reset_flag, post_cfg=post_cfg)
+        out_rgb = enhance_frame_tiled(
+            model, device, frame_bgr,
+            tile=tile, overlap=overlap, tile_batch=tile_batch,
+            harmonize=harmonize, guide_long=guide_long, post_cfg=post_cfg
+        )
         out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+        if (out_bgr.shape[1] != Ww) or (out_bgr.shape[0] != Hw):
+            out_bgr, _ = _ensure_even_for_writer(out_bgr)
         vw.write(out_bgr)
 
         processed += 1
@@ -320,11 +449,18 @@ def _process_video_loop(model, device, cap, vw, work_w, work_h,
     total = time.time() - t0
     return processed, total
 
-def enhance_video_file_single_gpu(model, device, src_path: Path, out_dir: Path,
-                                  batch_log=50, show_tqdm=True,
-                                  scene_reset=True, mae_thresh=10.0, bincorr_thresh=0.60,
-                                  periodic_reset=0, disable_temporal=False,
-                                  post_cfg: Optional[Dict]=None):
+def enhance_video_file_single_gpu(model,
+                                  device,
+                                  src_path: Path,
+                                  out_dir: Path,
+                                  batch_log=50,
+                                  show_tqdm=True,
+                                  tile: int = 512,
+                                  overlap: int = 128,
+                                  tile_batch: int = 8,
+                                  guide_long: int = 256,
+                                  harmonize: bool = True,
+                                  post_cfg: Optional[Dict] = None):
     cap = cv2.VideoCapture(str(src_path))
     if not cap.isOpened():
         print(f"[Skip] Cannot open video: {src_path}")
@@ -333,28 +469,24 @@ def enhance_video_file_single_gpu(model, device, src_path: Path, out_dir: Path,
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    work_w = _nearest_multiple_of(width, 8)
-    work_h = _nearest_multiple_of(height, 8)
+
     stem = src_path.stem
     ext = src_path.suffix.lower()
     out_name = f"enhanced_{stem}{ext}"
     out_path = out_dir / out_name
-    vw = _open_video_writer(out_path, fps, width, height)
+    vw, (writer_w, writer_h) = _open_video_writer(out_path, fps, width, height)
     if vw is None:
         print(f"[Error] Could not create VideoWriter for: {src_path}")
         cap.release()
         return
+
     print(f"[Video] {src_path.name} | {frame_count if frame_count>0 else 'unknown'} frames | {width}x{height} @ {fps:.3f}fps")
 
-    resetter = SceneResetter(mae_thresh, bincorr_thresh) if scene_reset and not disable_temporal else None
-    if resetter is not None:
-        resetter.reset()
-
-    processed, total = _process_video_loop(
-        model, device, cap, vw, work_w, work_h, frame_count, src_path.name,
-        resetter=resetter, periodic_reset=periodic_reset,
-        disable_temporal=disable_temporal, log_every=batch_log, show_tqdm=show_tqdm,
-        post_cfg=post_cfg
+    processed, total = _process_video_loop_tiled(
+        model, device, cap, vw, (writer_w, writer_h), frame_count, src_path.name,
+        log_every=batch_log, show_tqdm=show_tqdm,
+        tile=tile, overlap=overlap, tile_batch=tile_batch,
+        guide_long=guide_long, harmonize=harmonize, post_cfg=post_cfg
     )
 
     vw.release()
@@ -365,7 +497,7 @@ def enhance_video_file_single_gpu(model, device, src_path: Path, out_dir: Path,
     else:
         print(f"[Warn] No frames processed for: {src_path}")
 
-def _init_model_on_device(device_str: str, args) -> Tuple[RetinexEnhancer, torch.device]:
+def _init_model_on_device(device_str: str, args) -> Tuple['RetinexEnhancer', torch.device]:
     device = torch.device(device_str)
     if device.type == "cuda":
         torch.cuda.set_device(device.index or 0)
@@ -376,7 +508,7 @@ def _init_model_on_device(device_str: str, args) -> Tuple[RetinexEnhancer, torch
         model, args.ckpt, device,
         base_gain=args.base_gain, base_lift=args.base_lift,
         base_chroma=args.base_chroma, midtone_sat=args.midtone_sat,
-        sat_mid_sigma=args.sat_mid_sigma,                    
+        sat_mid_sigma=args.sat_mid_sigma,
         skin_protect_strength=args.skin_protect_strength,
         highlight_knee=args.highlight_knee, highlight_soft=args.highlight_soft
     )
@@ -388,7 +520,7 @@ def _init_model_on_device(device_str: str, args) -> Tuple[RetinexEnhancer, torch
             net.base_chroma_buf.fill_(float(args.base_chroma))
             net.sat_mid_strength_buf.fill_(float(args.midtone_sat))
             if hasattr(net, "sat_mid_sigma_buf"):
-                net.sat_mid_sigma_buf.fill_(float(args.sat_mid_sigma))   
+                net.sat_mid_sigma_buf.fill_(float(args.sat_mid_sigma))
             net.skin_protect_strength_buf.fill_(float(args.skin_protect_strength))
             net.highlight_knee_buf.fill_(float(args.highlight_knee))
             net.highlight_soft_buf.fill_(float(args.highlight_soft))
@@ -418,11 +550,8 @@ def _worker_process_videos(device_str: str, video_paths: List[str], out_dir: str
             enhance_video_file_single_gpu(
                 model, device, src_path, out_dir_path,
                 batch_log=args.log_every, show_tqdm=False,
-                scene_reset=not args.no_scene_reset,
-                mae_thresh=args.scene_reset_thresh,
-                bincorr_thresh=args.scene_bincorr_thresh,
-                periodic_reset=args.periodic_reset,
-                disable_temporal=args.no_temporal,
+                tile=args.tile_size, overlap=args.tile_overlap, tile_batch=args.tile_batch,
+                guide_long=args.guide_long, harmonize=(not args.no_harmonize),
                 post_cfg=post_cfg
             )
         except KeyboardInterrupt:
@@ -430,12 +559,6 @@ def _worker_process_videos(device_str: str, video_paths: List[str], out_dir: str
             return
         except Exception as e:
             print(f"[Error] Failed on {src_path}: {e}")
-
-def _distribute_targets_round_robin(targets: List[Path], num_bins: int) -> List[List[str]]:
-    bins = [[] for _ in range(num_bins)]
-    for i, p in enumerate(targets):
-        bins[i % num_bins].append(str(p))
-    return bins
 
 def _parse_gpu_ids(gpu_ids_arg: str) -> List[int]:
     ids = []
@@ -453,123 +576,57 @@ def _parse_gpu_ids(gpu_ids_arg: str) -> List[int]:
             out.append(i); seen.add(i)
     return out
 
-def _worker_process_segment_stream(
-    device_str: str,
-    video_path: str,
-    seg_id: int,
-    start_f: int,
-    end_f: int,
-    warmup: int,
-    work_w: int,
-    work_h: int,
-    q: mp.Queue,
-    args
-):
+def _gpu_worker_frames(gpu_id: int, args, writer_w: int, writer_h: int, in_q: mp.Queue, out_q: mp.Queue):
+    device_str = f"cuda:{gpu_id}"
     try:
         model, device = _init_model_on_device(device_str, args)
-    except Exception as e:
-        print(f"[Worker-Init-Error] seg{seg_id} {device_str}: {e}")
-        q.put((-1, None))
-        return
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        print(f"[Seg{seg_id}] Cannot open video: {video_path}")
-        q.put((-1, None))
-        return
-
-    start_with_warmup = max(0, start_f - warmup)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_with_warmup))
-
-    if hasattr(model, "_vid_state"):
-        delattr(model, "_vid_state")
-    model._vid_state = None
-
-    resetter = None
-    if not args.no_temporal and not args.no_scene_reset:
-        resetter = SceneResetter(args.scene_reset_thresh, args.scene_bincorr_thresh)
-        resetter.reset()
-
-    post_cfg = dict(
-        enable=args.post_enable, low_pct=args.post_low_pct, high_pct=args.post_high_pct,
-        hi_pct=args.post_hi_pct, hi_strength=args.post_hi_strength, do_black=(not args.post_no_black)
-    )
-
-    cur_idx = start_with_warmup
-    processed_since_reset = 0
-    try:
+        post_cfg = dict(
+            enable=args.post_enable, low_pct=args.post_low_pct, high_pct=args.post_high_pct,
+            hi_pct=args.post_hi_pct, hi_strength=args.post_hi_strength, do_black=(not args.post_no_black)
+        )
         while True:
-            if cur_idx >= end_f:
+            item = in_q.get()
+            if item is None:
                 break
-            ok, frame_bgr = cap.read()
-            if not ok:
-                break
-
-            if cur_idx < start_f:
-                _ = enhance_frame(model, device, frame_bgr, (work_w, work_h),
-                                   reset_state=args.no_temporal, post_cfg=post_cfg)
-                cur_idx += 1
-                continue
-
-            reset_flag = args.no_temporal
-            if not reset_flag:
-                if resetter is not None and resetter.is_scene_change(frame_bgr):
-                    reset_flag = True
-                    processed_since_reset = 0
-                if args.periodic_reset > 0 and processed_since_reset > 0 and (processed_since_reset % args.periodic_reset == 0):
-                    reset_flag = True
-
-            out_rgb = enhance_frame(model, device, frame_bgr, (work_w, work_h),
-                                    reset_state=reset_flag, post_cfg=post_cfg)
+            idx, frame_bgr = item
+            out_rgb = enhance_frame_tiled(
+                model, device, frame_bgr,
+                tile=args.tile_size, overlap=args.tile_overlap, tile_batch=args.tile_batch,
+                harmonize=(not args.no_harmonize), guide_long=args.guide_long, post_cfg=post_cfg
+            )
             out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
-            q.put((cur_idx, out_bgr), block=True)
-
-            cur_idx += 1
-            processed_since_reset += 1
+            if (writer_w, writer_h) != (out_bgr.shape[1], out_bgr.shape[0]):
+                out_bgr, _ = _ensure_even_for_writer(out_bgr)
+            out_q.put((idx, out_bgr))
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"[Worker cuda:{gpu_id}] error: {e}")
     finally:
-        cap.release()
-        q.put((-1, None))
-
-def _streaming_merge_from_queue(q: mp.Queue, writer: cv2.VideoWriter, total_frames: int, src_name: str):
-    next_to_write = 0
-    buffer = {}
-    written = 0
-    with tqdm(total=total_frames, desc=f"Processing {src_name}", unit="frame") as pbar:
-        while written < total_frames:
-            if next_to_write in buffer:
-                writer.write(buffer.pop(next_to_write))
-                next_to_write += 1
-                written += 1
-                continue
-            idx, frm = q.get()
-            if idx == -1 and frm is None:
-                continue
-            buffer[idx] = frm
-            pbar.update(1)
+        out_q.put(None)
 
 def main():
-    parser = argparse.ArgumentParser(description="Color Enhancement Video Test (scene-reset, multi-GPU, optional post expand)")
+    parser = argparse.ArgumentParser(description="Color Enhancement Video Test (tiled 512x512 + Multi-GPU per-frame)")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--ckpt", required=True)
-
-    parser.add_argument("--base_gain", type=float, default=1.30)
+    
+    parser.add_argument("--base_gain", type=float, default=1.50)
     parser.add_argument("--base_lift", type=float, default=0.08)
-    parser.add_argument("--base_chroma", type=float, default=1.20)
+    parser.add_argument("--base_chroma", type=float, default=1.50)
     parser.add_argument("--midtone_sat", type=float, default=0.04)
-    parser.add_argument("--sat_mid_sigma", type=float, default=0.34)  
+    parser.add_argument("--sat_mid_sigma", type=float, default=0.34)
     parser.add_argument("--skin_protect_strength", type=float, default=0.90)
     parser.add_argument("--highlight_knee", type=float, default=0.90)
     parser.add_argument("--highlight_soft", type=float, default=0.55)
 
     parser.add_argument("--log_every", type=int, default=50)
 
-    parser.add_argument("--no_temporal", action="store_true")
-    parser.add_argument("--no_scene_reset", action="store_true")
-    parser.add_argument("--scene_reset_thresh", type=float, default=10.0)
-    parser.add_argument("--scene_bincorr_thresh", type=float, default=0.60)
-    parser.add_argument("--periodic_reset", type=int, default=0)
+    parser.add_argument("--tile_size", type=int, default=512)
+    parser.add_argument("--tile_overlap", type=int, default=128)
+    parser.add_argument("--tile_batch", type=int, default=8)
+    parser.add_argument("--no_harmonize", action="store_true")
+    parser.add_argument("--guide_long", type=int, default=256)
 
     parser.add_argument("--post_enable", action="store_true")
     parser.add_argument("--post_low_pct", type=float, default=0.005)
@@ -579,8 +636,7 @@ def main():
     parser.add_argument("--post_no_black", action="store_true")
 
     parser.add_argument("--gpu_ids", type=str, default="")
-    parser.add_argument("--segment_warmup", type=int, default=8)
-    parser.add_argument("--queue_size", type=int, default=16)
+    parser.add_argument("--queue_size", type=int, default=64)
 
     args = parser.parse_args()
 
@@ -616,15 +672,14 @@ def main():
     )
 
     if not chosen:
-        print("[Run] No CUDA device found → CPU mode (single worker)")
-        device = torch.device("cpu")
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         model = RetinexEnhancer().to(device)
         ensure_registered_buffers(model)
         load_compat_ckpt(
             model, args.ckpt, device,
             base_gain=args.base_gain, base_lift=args.base_lift,
             base_chroma=args.base_chroma, midtone_sat=args.midtone_sat,
-            sat_mid_sigma=args.sat_mid_sigma,           
+            sat_mid_sigma=args.sat_mid_sigma,
             skin_protect_strength=args.skin_protect_strength,
             highlight_knee=args.highlight_knee, highlight_soft=args.highlight_soft
         )
@@ -636,25 +691,22 @@ def main():
                 net.base_chroma_buf.fill_(float(args.base_chroma))
                 net.sat_mid_strength_buf.fill_(float(args.midtone_sat))
                 if hasattr(net, "sat_mid_sigma_buf"):
-                    net.sat_mid_sigma_buf.fill_(float(args.sat_mid_sigma)) 
+                    net.sat_mid_sigma_buf.fill_(float(args.sat_mid_sigma))
                 net.skin_protect_strength_buf.fill_(float(args.skin_protect_strength))
                 net.highlight_knee_buf.fill_(float(args.highlight_knee))
                 net.highlight_soft_buf.fill_(float(args.highlight_soft))
                 net.use_resolve_style = True
             except Exception:
                 pass
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.benchmark = True
         model.eval()
-        print(f"[Run] CPU | {len(targets)} videos")
+        print(f"[Run] {device.type.upper()} | {len(targets)} videos (tiled {args.tile_size} overlap {args.tile_overlap} batch {args.tile_batch})")
         for src in tqdm(targets, desc="Videos", unit="file"):
             enhance_video_file_single_gpu(
                 model, device, src, out_dir,
                 batch_log=args.log_every, show_tqdm=True,
-                scene_reset=not args.no_scene_reset,
-                mae_thresh=args.scene_reset_thresh,
-                bincorr_thresh=args.scene_bincorr_thresh,
-                periodic_reset=args.periodic_reset,
-                disable_temporal=args.no_temporal,
+                tile=args.tile_size, overlap=args.tile_overlap, tile_batch=args.tile_batch,
+                guide_long=args.guide_long, harmonize=(not args.no_harmonize),
                 post_cfg=post_cfg
             )
         print("[Run] Complete")
@@ -662,11 +714,13 @@ def main():
 
     if len(targets) > 1:
         print(f"[Run] Multi-GPU per-file mode on GPUs {chosen} | {len(targets)} videos")
-        bins = _distribute_targets_round_robin(targets, len(chosen))
         try:
             mp.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
+        bins = [[] for _ in range(len(chosen))]
+        for i, p in enumerate(targets):
+            bins[i % len(chosen)].append(str(p))
         procs = []
         for rank, gpu_id in enumerate(chosen):
             dev_str = f"cuda:{gpu_id}"
@@ -692,76 +746,95 @@ def main():
         return
 
     src = targets[0]
-    cap0 = cv2.VideoCapture(str(src))
-    if not cap0.isOpened():
-        print(f"[Error] Cannot open video: {src}")
+    cap = cv2.VideoCapture(str(src))
+    if not cap.isOpened():
+        print(f"[Skip] Cannot open video: {src}")
         sys.exit(1)
-    fps = cap0.get(cv2.CAP_PROP_FPS) or 30.0
-    width = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_count = int(cap0.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap0.release()
 
-    work_w = _nearest_multiple_of(width, 8)
-    work_h = _nearest_multiple_of(height, 8)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    W   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    N   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    num_segs = min(len(chosen), max(1, frame_count))
-    base = frame_count // num_segs
-    rem = frame_count % num_segs
-    ranges = []
-    start = 0
-    for i in range(num_segs):
-        seg_len = base + (1 if i < rem else 0)
-        end = start + seg_len
-        if start >= end:
-            continue
-        ranges.append((start, end))
-        start = end
+    out_path = out_dir / f"enhanced_{src.stem}{src.suffix}"
+    vw, (writer_w, writer_h) = _open_video_writer(out_path, fps, W, H)
+    if vw is None:
+        print(f"[Error] Could not create VideoWriter: {out_path}")
+        sys.exit(1)
 
-    stem = src.stem
-    ext = src.suffix.lower()
-    out_name = f"enhanced_{stem}{ext}"
-    out_path = out_dir / out_name
-
-    print(f"[Run] Single video split into {len(ranges)} segment(s) over GPUs {chosen}")
-    print(f"       total frames={frame_count}, warmup={args.segment_warmup}, size={width}x{height}@{fps:.3f}")
+    print(f"[Run] Single video multi-GPU per-frame on {chosen} | {src.name} | {N if N>0 else 'unknown'} frames")
+    t_multi_start = time.time()
 
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
 
-    vw = _open_video_writer(out_path, fps, width, height)
-    if vw is None:
-        print(f"[Error] Could not create VideoWriter for: {src}")
-        sys.exit(1)
-
-    q = mp.Queue(maxsize=max(4, args.queue_size))
+    in_q  = mp.Queue(maxsize=max(2, args.queue_size))
+    out_q = mp.Queue(maxsize=max(2, args.queue_size))
 
     procs = []
-    t0 = time.time()
-    for i, (s, e) in enumerate(ranges):
-        gpu_id = chosen[i % len(chosen)]
-        dev_str = f"cuda:{gpu_id}"
-        p = mp.Process(
-            target=_worker_process_segment_stream,
-            args=(dev_str, str(src), i, s, e, args.segment_warmup, work_w, work_h, q, args),
-            daemon=False
-        )
+    for gid in chosen:
+        p = mp.Process(target=_gpu_worker_frames,
+                       args=(gid, args, writer_w, writer_h, in_q, out_q),
+                       daemon=True)
         p.start()
         procs.append(p)
 
-    try:
-        _streaming_merge_from_queue(q, vw, frame_count, src.name)
-    finally:
-        for p in procs:
-            if p.is_alive():
-                p.join()
-        vw.release()
+    next_write = 0
+    buffer: Dict[int, np.ndarray] = {}
+    finished_workers = 0
 
-    total = time.time() - t0
-    proc_fps = frame_count / max(1e-6, total)
-    print(f"[Done] {src.name} → {out_path.name} | {frame_count} frames | proc {proc_fps:.2f} FPS | video_fps {fps:.3f}")
+    pbar = tqdm(total=N if N>0 else 0, desc=f"Processing {src.name}", unit="frame", disable=(N<=0))
+
+    idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        in_q.put((idx, frame))
+        idx += 1
+
+        while not out_q.empty():
+            item = out_q.get()
+            if item is None:
+                finished_workers += 1
+                continue
+            i, f = item
+            buffer[i] = f
+            while next_write in buffer:
+                vw.write(buffer.pop(next_write))
+                next_write += 1
+                if N > 0:
+                    pbar.update(1)
+
+    for _ in procs:
+        in_q.put(None)
+
+    while finished_workers < len(procs) or buffer:
+        item = out_q.get()
+        if item is None:
+            finished_workers += 1
+            continue
+        i, f = item
+        buffer[i] = f
+        while next_write in buffer:
+            vw.write(buffer.pop(next_write))
+            next_write += 1
+            if N > 0:
+                pbar.update(1)
+
+    pbar.close()
+    vw.release()
+    cap.release()
+    for p in procs:
+        p.join()
+
+    t_multi = time.time() - t_multi_start
+    avg_proc_fps = (next_write / max(1e-6, t_multi)) if next_write > 0 else 0.0
+    print(f"[Done] {src.name} → {out_path.name} | frames={next_write} | "
+          f"total_time {t_multi:.2f}s | avg_proc_fps {avg_proc_fps:.2f} | video_fps {fps:.3f}")
+    print("[Run] Complete")
 
 if __name__ == "__main__":
     main()
