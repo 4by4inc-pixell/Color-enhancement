@@ -36,14 +36,14 @@ Download onnx models: [ONNX model](https://drive.google.com/file/d/1VZJf6QmqvIm1
 
 Run the following command for test:
 
-- Pytorch model test:
+- Pytorch model video test:
 ```bash
-python pytorch_video_test.py --video_path<input video path> --model_path<pytorch color-enhancement model> --save_dir<generated color enhance video path> 
+python pytorch_video_test.py --input<input video path> --output_dir<generated color enhance video path> --ckpt<pytorch color-enhancement model> --gpu_ids<ex)0,1,2,3>
 ```
 
 - ONNX model test:
 ```bash
-python onnx_video_test.py --video_path<input video path> --onnx_path<onnx color-enhancement model> ---save_dir<generated color enhance video path> 
+python onnx_video_test.py --input<input video path> ---output_dir<generated color enhance video path> --onnx_step<onnx color-enhancement model> --gpu_ids<ex)0,1,2,3>
 ```
 
 
