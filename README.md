@@ -41,7 +41,7 @@ Run the following command for test:
 python pytorch_video_test.py --input<input video path> --output_dir<generated color enhance video path> --ckpt<pytorch color-enhancement model> --gpu_ids<ex)0,1,2,3>
 ```
 
-- ONNX model test:
+- ONNX model video test:
 ```bash
 python onnx_video_test.py --input<input video path> ---output_dir<generated color enhance video path> --onnx_step<onnx color-enhancement model> --gpu_ids<ex)0,1,2,3>
 ```
