@@ -118,23 +118,30 @@ def load_compat_ckpt(
     return model
 
 class GRUCellONNX(nn.Module):
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, input_size, hidden_size, bias=True):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.weight_ih = nn.Parameter(torch.empty(3 * hidden_size, input_size))
         self.weight_hh = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
-        self.bias_ih   = nn.Parameter(torch.empty(3 * hidden_size))
-        self.bias_hh   = nn.Parameter(torch.empty(3 * hidden_size))
+        if bias:
+            self.bias_ih = nn.Parameter(torch.empty(3 * hidden_size))
+            self.bias_hh = nn.Parameter(torch.empty(3 * hidden_size))
+        else:
+            self.register_parameter("bias_ih", None)
+            self.register_parameter("bias_hh", None)
         self.reset_parameters()
+
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.weight_ih)
         nn.init.xavier_uniform_(self.weight_hh)
-        nn.init.zeros_(self.bias_ih)
-        nn.init.zeros_(self.bias_hh)
+        if self.bias_ih is not None:
+            nn.init.zeros_(self.bias_ih)
+            nn.init.zeros_(self.bias_hh)
+
     def forward(self, x, h):
-        gi = torch.addmm(self.bias_ih, x, self.weight_ih.t())
-        gh = torch.addmm(self.bias_hh, h, self.weight_hh.t())
+        gi = torch.addmm(self.bias_ih, x, self.weight_ih.t()) if self.bias_ih is not None else x @ self.weight_ih.t()
+        gh = torch.addmm(self.bias_hh, h, self.weight_hh.t()) if self.bias_hh is not None else h @ self.weight_hh.t()
         i_r, i_z, i_n = gi.chunk(3, dim=1)
         h_r, h_z, h_n = gh.chunk(3, dim=1)
         r = torch.sigmoid(i_r + h_r)
@@ -143,23 +150,55 @@ class GRUCellONNX(nn.Module):
         hy = (1 - z) * n + z * h
         return hy
 
-def replace_meta_gru_with_onnx_cell(model: RetinexEnhancer):
-    assert hasattr(model, "net") and hasattr(model.net, "meta_gru")
-    old = model.net.meta_gru
-    if isinstance(old, GRUCellONNX):
+class OnnxSafeGRU1Step(nn.Module):
+    def __init__(self, gru: nn.GRU):
+        super().__init__()
+        assert gru.num_layers == 1 and not gru.bidirectional, "1-layer, 단방향만 지원"
+        self.input_size = gru.input_size
+        self.hidden_size = gru.hidden_size
+        W_ih = gru.weight_ih_l0.detach().clone()
+        W_hh = gru.weight_hh_l0.detach().clone()
+        b_ih = gru.bias_ih_l0.detach().clone()
+        b_hh = gru.bias_hh_l0.detach().clone()
+        H = self.hidden_size
+        self.W_ir = nn.Parameter(W_ih[0:H])
+        self.W_iz = nn.Parameter(W_ih[H:2*H])
+        self.W_in = nn.Parameter(W_ih[2*H:3*H])
+        self.b_r = nn.Parameter(b_ih[0:H]     + b_hh[0:H])
+        self.b_z = nn.Parameter(b_ih[H:2*H]   + b_hh[H:2*H])
+        self.b_n = nn.Parameter(b_ih[2*H:3*H] + b_hh[2*H:3*H])
+
+    def forward(self, x, hx=None):
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        if x.size(1) != 1:
+            x = x[:, :1, :]
+        x0 = x[:, 0, :]
+        r = torch.sigmoid(x0 @ self.W_ir.t() + self.b_r)
+        z = torch.sigmoid(x0 @ self.W_iz.t() + self.b_z)
+        n = torch.tanh(   x0 @ self.W_in.t() + self.b_n)
+        h = (1.0 - z) * n
+        return h.unsqueeze(1), h.unsqueeze(0)
+
+def replace_meta_gru_with_onnx_safe(model: RetinexEnhancer):
+    if not hasattr(model, "net") or not hasattr(model.net, "meta_gru"):
         return model
-    if not isinstance(old, nn.GRUCell):
-        raise TypeError(f"meta_gru is {type(old)}, expected nn.GRUCell")
-    new_cell = GRUCellONNX(old.input_size, old.hidden_size)
-    with torch.no_grad():
-        new_cell.weight_ih.copy_(old.weight_ih)
-        new_cell.weight_hh.copy_(old.weight_hh)
-        if old.bias:
-            new_cell.bias_ih.copy_(old.bias_ih)
-            new_cell.bias_hh.copy_(old.bias_hh)
-        else:
-            new_cell.bias_ih.zero_(); new_cell.bias_hh.zero_()
-    model.net.meta_gru = new_cell
+    mg = model.net.meta_gru
+    if isinstance(mg, nn.GRUCell):
+        safe = GRUCellONNX(mg.input_size, mg.hidden_size, bias=True)
+        with torch.no_grad():
+            safe.weight_ih.copy_(mg.weight_ih)
+            safe.weight_hh.copy_(mg.weight_hh)
+            if mg.bias:
+                safe.bias_ih.copy_(mg.bias_ih)
+                safe.bias_hh.copy_(mg.bias_hh)
+        model.net.meta_gru = safe
+        print("[Patch] meta_gru: nn.GRUCell -> GRUCellONNX")
+    elif isinstance(mg, nn.GRU):
+        model.net.meta_gru = OnnxSafeGRU1Step(mg)
+        print("[Patch] meta_gru: nn.GRU -> OnnxSafeGRU1Step (1-step, h0=0)")
+    else:
+        print(f"[Patch] meta_gru not GRU/GRUCell ({type(mg)}) – keep as is.")
     return model
 
 def _approx_quantile_via_hist(Y, q: float, bins: int = 1024):
@@ -269,46 +308,8 @@ def patch_apply_params_tensor_only(model: RetinexEnhancer):
         chroma_total_gain = 1.0 + (chroma_total_gain - 1.0) * (0.40 + 0.60 * hl_weight)
         chroma_total_gain = torch.clamp(chroma_total_gain, 0.92, 1.18)
 
-        r, g, b = y[:,0:1], y[:,1:2], y[:,2:3]
-        maxc, _ = torch.max(y, dim=1, keepdim=True)
-        minc, _ = torch.min(y, dim=1, keepdim=True)
-        V = maxc
-        S = (maxc - minc) / (maxc + 1e-6)
-
-        cb_min, cb_max = 77/255.0, 127/255.0
-        cr_min, cr_max = 133/255.0, 173/255.0
-        seed = ((Cb >= cb_min) & (Cb <= cb_max) & (Cr >= cr_min) & (Cr <= cr_max)).float()
-        hsv_gate = (S > 0.05).float() * (V > 0.10).float()
-        seed = seed * hsv_gate
-
-        msum = seed.sum(dim=(2,3), keepdim=True).clamp_min(1.0)
-        mu_cb = (Cb * seed).sum(dim=(2,3), keepdim=True) / msum
-        mu_cr = (Cr * seed).sum(dim=(2,3), keepdim=True) / msum
-        var_cb = ((Cb - mu_cb)**2 * seed).sum(dim=(2,3), keepdim=True) / msum
-        var_cr = ((Cr - mu_cr)**2 * seed).sum(dim=(2,3), keepdim=True) / msum
-        var_cb = var_cb.clamp_min(1e-4); var_cr = var_cr.clamp_min(1e-4)
-        d2 = (Cb - mu_cb)**2 / var_cb + (Cr - mu_cr)**2 / var_cr
-        prob = torch.exp(-0.5 * d2)
-        red_like = (r >= g) & (r >= b) & ((r - (g + b) * 0.5) > 0.05)
-        lip = ((S > 0.45) & (V > 0.25) & red_like).float()
-        prob = prob * (1.0 - 0.7 * lip)
-        prob = prob * (1.0 - (Y - 0.90).clamp(min=0) / 0.10)
-        prob = F.avg_pool2d(prob, 3, 1, 1)
-        prob = F.avg_pool2d(prob, 5, 1, 2).clamp(0, 1)
-
-        sps = float(self.skin_protect_strength_buf)
-        sps_map = sps * torch.pow(prob, 0.8)
-
-        dy = F.pad(Y[:, :, 1:] - Y[:, :, :-1], (0, 0, 0, 1))
-        dx = F.pad(Y[:, :, :, 1:] - Y[:, :, :, :-1], (0, 1, 0, 0))
-        mag = torch.sqrt(dx * dx + dy * dy + 1e-6)
-        edge_w = torch.exp(-6.0 * F.avg_pool2d(mag, 3, 1, 1))
-        eg = 1.0 + (chroma_total_gain - 1.0) * (1.0 - sps_map)
-        eg_smooth = F.avg_pool2d(eg, 3, 1, 1)
-        eg = eg * (1.0 - 0.35 * edge_w) + eg_smooth * (0.35 * edge_w)
-
-        Cb = (Cb - 0.5) * eg + 0.5
-        Cr = (Cr - 0.5) * eg + 0.5
+        Cb = (Cb - 0.5) * chroma_total_gain + 0.5
+        Cr = (Cr - 0.5) * chroma_total_gain + 0.5
         Cb, Cr = _gamut_safe_chroma(Y, Cb, Cr)
 
         return _ycbcr_to_rgb(Y, Cb, Cr)
@@ -339,30 +340,16 @@ class ImageOnlyWrapper(nn.Module):
         y, _, _ = self.core(x, None, None, True)
         return y
 
-class StepStatefulWrapper(nn.Module):
-    def __init__(self, core: RetinexEnhancer, meta_dim: int = 64, base: int = 48):
-        super().__init__()
-        self.core = core
-        self.meta_dim = meta_dim
-        self.hidden_ch = base * 8
-    def forward(self, x, meta_h, lstm_h, lstm_c):
-        state = {"meta_h": meta_h, "lstm_b": (lstm_h, lstm_c)}
-        y, _, new_state = self.core(x, None, state, False)
-        new_meta_h = new_state["meta_h"]
-        new_lstm_h, new_lstm_c = new_state["lstm_b"]
-        return y, new_meta_h, new_lstm_h, new_lstm_c
-
 def main():
-    ap = argparse.ArgumentParser(description="Export RetinexEnhancer to ONNX (image + stateful step)")
+    ap = argparse.ArgumentParser(description="Export RetinexEnhancer to ONE ONNX (image in/out)")
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--out_single", default="color_image_1001.onnx")
-    ap.add_argument("--out_step", default="color_video_1001.onnx")
-    
+    ap.add_argument("--out", default="color_enhance.onnx")
     ap.add_argument("--opset", type=int, default=17)
+
     ap.add_argument("--base_gain", type=float, default=1.30)
     ap.add_argument("--base_lift", type=float, default=0.08)
-    ap.add_argument("--base_chroma", type=float, default=1.20)
-    ap.add_argument("--midtone_sat", type=float, default=0.04)
+    ap.add_argument("--base_chroma", type=float, default=1.15) 
+    ap.add_argument("--midtone_sat", type=float, default=0.02) 
     ap.add_argument("--sat_mid_sigma", type=float, default=0.34)
     ap.add_argument("--skin_protect", type=float, default=0.90)
     ap.add_argument("--highlight_knee", type=float, default=0.90)
@@ -374,8 +361,10 @@ def main():
     ap.add_argument("--no_const_fold", action="store_true")
     args = ap.parse_args()
 
-    out_single = Path(args.out_single); out_single.parent.mkdir(parents=True, exist_ok=True)
-    out_step = Path(args.out_step); out_step.parent.mkdir(parents=True, exist_ok=True)
+    out_path = Path(args.out); out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    torch.backends.cudnn.enabled = False
+    torch.backends.mkldnn.enabled = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Export] device={device}, opset={args.opset}")
@@ -390,64 +379,31 @@ def main():
         use_midtone_sat=(not args.no_midtone_sat),
         sat_mid_sigma=args.sat_mid_sigma
     )
-    replace_meta_gru_with_onnx_cell(model)
+
+    replace_meta_gru_with_onnx_safe(model)        
     ensure_registered_buffers(model)
-    patch_apply_params_tensor_only(model)  
-    patch_up_forward_no_branch(model)
+    patch_apply_params_tensor_only(model)         
+    patch_up_forward_no_branch(model)             
     model.eval()
 
-    image_wrapper = ImageOnlyWrapper(model).to(device).eval()
-    dummy_img = torch.randn(1, 3, args.height, args.width, device=device)
-    dyn_axes_img = {
-        "input": {0: "batch", 2: "height", 3: "width"},
-        "output": {0: "batch", 2: "height", 3: "width"}
-    }
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=r"Constant folding - Only steps=1 can be constant folded.*")
-        torch.onnx.export(
-            image_wrapper, (dummy_img,), str(out_single),
-            input_names=["input"], output_names=["output"],
-            dynamic_axes=dyn_axes_img,
-            opset_version=args.opset,
-            do_constant_folding=not args.no_const_fold
-        )
-    print(f"[OK] Exported image model -> {out_single}")
+    wrapper = ImageOnlyWrapper(model).to(device).eval()
+    dummy = torch.randn(1, 3, args.height, args.width, device=device)
 
-    meta_dim = getattr(model.net, "meta_dim", 64)
-    base = 48
-    hidden_ch = base * 8
-    step_wrapper = StepStatefulWrapper(model, meta_dim=meta_dim, base=base).to(device).eval()
-
-    H, W = args.height, args.width
-    Hb, Wb = (H + 7) // 8, (W + 7) // 8
-    dummy_x = torch.randn(1, 3, H, W, device=device)
-    dummy_meta_h = torch.zeros(1, meta_dim, device=device)
-    dummy_h = torch.zeros(1, hidden_ch, Hb, Wb, device=device)
-    dummy_c = torch.zeros(1, hidden_ch, Hb, Wb, device=device)
-
-    dyn_axes_step = {
-        "input": {0: "batch", 2: "height", 3: "width"},
-        "meta_h": {0: "batch"},
-        "lstm_h": {0: "batch", 2: "h8", 3: "w8"},
-        "lstm_c": {0: "batch", 2: "h8", 3: "w8"},
+    dyn_axes = {
+        "input":  {0: "batch", 2: "height", 3: "width"},
         "output": {0: "batch", 2: "height", 3: "width"},
-        "new_meta_h": {0: "batch"},
-        "new_lstm_h": {0: "batch", 2: "h8", 3: "w8"},
-        "new_lstm_c": {0: "batch", 2: "h8", 3: "w8"},
     }
+
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=r"Constant folding - Only steps=1 can be constant folded.*")
         torch.onnx.export(
-            step_wrapper, (dummy_x, dummy_meta_h, dummy_h, dummy_c),
-            str(out_step),
-            input_names=["input", "meta_h", "lstm_h", "lstm_c"],
-            output_names=["output", "new_meta_h", "new_lstm_h", "new_lstm_c"],
-            dynamic_axes=dyn_axes_step,
+            wrapper, (dummy,), str(out_path),
+            input_names=["input"], output_names=["output"],
+            dynamic_axes=dyn_axes,
             opset_version=args.opset,
             do_constant_folding=not args.no_const_fold
         )
-    print(f"[OK] Exported stateful step model -> {out_step}")
-    print("[DONE] ONNX export complete.")
+    print(f"[OK] Exported unified ONNX -> {out_path}")
 
 if __name__ == "__main__":
     main()
