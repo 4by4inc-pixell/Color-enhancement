@@ -24,11 +24,11 @@ pip install -r requirements.txt
 
 ## Download Pre-trained Models
 
-Download pytorch models: [Pytorch model](https://drive.google.com/file/d/1ZA35k9pjxS98zedBYQT7YXoYtgiPxTSQ/view?usp=drive_link).
+Download pytorch models: [Pytorch model].
 
 
 
-Download onnx models: [ONNX model](https://drive.google.com/file/d/1VtzCcph1rfSxyrfYLsp0IH49P5w2vzW6/view?usp=drive_link).
+Download onnx models: [ONNX model].
 
 
 ## Test
