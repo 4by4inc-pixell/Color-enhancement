@@ -611,10 +611,10 @@ def main():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--ckpt", required=True)
     
-    parser.add_argument("--base_gain", type=float, default=1.50)
+    parser.add_argument("--base_gain", type=float, default=1.30)
     parser.add_argument("--base_lift", type=float, default=0.08)
-    parser.add_argument("--base_chroma", type=float, default=1.50)
-    parser.add_argument("--midtone_sat", type=float, default=0.04)
+    parser.add_argument("--base_chroma", type=float, default=1.15)
+    parser.add_argument("--midtone_sat", type=float, default=0.02)
     parser.add_argument("--sat_mid_sigma", type=float, default=0.34)
     parser.add_argument("--skin_protect_strength", type=float, default=0.90)
     parser.add_argument("--highlight_knee", type=float, default=0.90)
