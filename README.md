@@ -42,7 +42,7 @@ python pytorch_video_test.py --input<input video path> --output_dir<generated co
 
 - ONNX model video test:
 ```bash
-python onnx_video_test.py --input<input video path> ---output_dir<generated color enhance video path> --onnx_step<onnx color-enhancement model> --gpu_ids<ex)0,1,2,3>
+python onnx_video_test.py --input<input video path> ---output_dir<generated color enhance video path> --onnx<onnx color-enhancement model> --gpu_ids<ex)0,1,2,3>
 ```
 
 
