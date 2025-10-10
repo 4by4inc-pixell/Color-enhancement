@@ -48,10 +48,8 @@ def enhance_image(sess, img_pil: Image.Image):
     new_h = _nearest_multiple_of(h, 8)
     bicubic = _get_resample_bicubic()
     img_resized = img_pil.resize((new_w, new_h), bicubic)
-    x = np.asarray(img_resized, dtype=np.uint8)
-    x = x.astype(np.float32) / 255.0
-    x = np.transpose(x, (2, 0, 1))
-    x = np.expand_dims(x, 0).copy()
+    x = np.asarray(img_resized, dtype=np.uint8).astype(np.float32) / 255.0
+    x = np.transpose(x, (2, 0, 1))[None, ...].copy()
     y = _run_onnx(sess, x)
     y = np.clip(y, 0.0, 1.0)
     y = np.squeeze(y, 0)
