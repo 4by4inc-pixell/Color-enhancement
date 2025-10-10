@@ -42,24 +42,10 @@ def _from_chw01_to_rgb_uint8(y):
     out = (y * 255.0 + 0.5).astype(np.uint8)
     return out
 
-def _run_step_batch(sess: ort.InferenceSession, x: np.ndarray):
-    B, _, H, W = x.shape
-    meta_dim = 64
-    hidden_ch = 48 * 8
-    Hb, Wb = max(1, H // 8), max(1, W // 8)
-    meta_h = np.zeros((B, meta_dim), dtype=np.float32)
-    lstm_h = np.zeros((B, hidden_ch, Hb, Wb), dtype=np.float32)
-    lstm_c = np.zeros((B, hidden_ch, Hb, Wb), dtype=np.float32)
-    outs = sess.run(
-        None,
-        {
-            sess.get_inputs()[0].name: x,
-            sess.get_inputs()[1].name: meta_h,
-            sess.get_inputs()[2].name: lstm_h,
-            sess.get_inputs()[3].name: lstm_c,
-        },
-    )
-    y = outs[0]
+def _run_single_batch(sess: ort.InferenceSession, x: np.ndarray):
+    inp = sess.get_inputs()[0].name
+    out = sess.get_outputs()[0].name
+    y = sess.run([out], {inp: x})[0]
     return y
 
 def _hann2d(h: int, w: int):
@@ -87,7 +73,6 @@ def _ensure_even_for_writer(img_bgr: np.ndarray) -> Tuple[np.ndarray, Tuple[int,
     out = cv2.copyMakeBorder(img_bgr, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0))
     return out, (pad_h, pad_w)
 
-
 def _gen_starts(size: int, tile: int, stride: int) -> List[int]:
     if size <= tile:
         return [0]
@@ -105,7 +90,7 @@ def _extract_tiles(image_f32: np.ndarray, tile: int, overlap: int) -> Tuple[List
     if (Hp, Wp) != (H, W):
         img_pad = cv2.copyMakeBorder(image_f32, 0, Hp - H, 0, Wp - W, cv2.BORDER_REPLICATE)
     else:
-        img_pad = image_f32  
+        img_pad = image_f32
 
     ys = _gen_starts(Hp, tile, stride)
     xs = _gen_starts(Wp, tile, stride)
@@ -144,7 +129,7 @@ def _harmonize_tile(tile_out: np.ndarray, guide_patch: np.ndarray) -> np.ndarray
     return np.clip(aligned, 0.0, 1.0)
 
 def enhance_frame_onnx(
-    sess_step: ort.InferenceSession,
+    sess: ort.InferenceSession,
     frame_bgr: np.ndarray,
     work_size: Tuple[int, int],  
     tile: int = 512,
@@ -154,7 +139,6 @@ def enhance_frame_onnx(
     guide_long: int = 768,
     post_cfg: Optional[Dict] = None,
 ):
-
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     padded_rgb, (pad_h, pad_w) = _pad_to_stride_rgb(frame_rgb, stride=8)
     im = padded_rgb.astype(np.float32) / 255.0
@@ -172,7 +156,7 @@ def enhance_frame_onnx(
         gW8 = _nearest_multiple_of(gW, 8)
         xg = cv2.resize(im, (gW8, gH8), interpolation=cv2.INTER_AREA)
         xg_chw = np.transpose(xg, (2, 0, 1))[None].astype(np.float32)
-        yg = _run_step_batch(sess_step, xg_chw)
+        yg = _run_single_batch(sess, xg_chw)
         yg_img = _from_chw01_to_rgb_uint8(yg)
         yg_img = cv2.resize(yg_img, (W_pad, H_pad), interpolation=cv2.INTER_CUBIC)
         guide = yg_img.astype(np.float32) / 255.0
@@ -183,7 +167,7 @@ def enhance_frame_onnx(
     for i in range(0, len(tiles), tile_batch):
         batch = tiles[i:i + tile_batch]
         xb = np.stack([np.transpose(p, (2, 0, 1)) for p in batch], axis=0).astype(np.float32)
-        yb = _run_step_batch(sess_step, xb)
+        yb = _run_single_batch(sess, xb)
         for k in range(yb.shape[0]):
             yk = _from_chw01_to_rgb_uint8(yb[k:k+1])
             tiles_out.append(yk.astype(np.float32) / 255.0)
@@ -266,7 +250,7 @@ def _open_video_writer(out_path: Path, fps, w, h) -> Tuple[Optional[cv2.VideoWri
     return None, (writer_w, writer_h)
 
 def enhance_video_file_single_gpu_onnx(device_str: str,
-                                       onnx_step: str,
+                                       onnx_path: str,
                                        src_path: Path,
                                        out_dir: Path,
                                        tile: int,
@@ -296,7 +280,7 @@ def enhance_video_file_single_gpu_onnx(device_str: str,
         return
 
     print(f"[Video] {src_path.name} | {frame_count if frame_count>0 else 'unknown'} frames | {width}x{height} @ {fps:.3f}fps")
-    sess_step = _load_session(onnx_step, device_str)
+    sess = _load_session(onnx_path, device_str)
 
     pbar = tqdm(total=frame_count, desc=f"Processing {src_path.name}", unit="frame", disable=not show_tqdm or frame_count<=0)
     processed = 0
@@ -306,7 +290,7 @@ def enhance_video_file_single_gpu_onnx(device_str: str,
         if not ok:
             break
         out_rgb = enhance_frame_onnx(
-            sess_step, frame_bgr, (width, height),
+            sess, frame_bgr, (width, height),
             tile=tile, overlap=overlap, tile_batch=tile_batch,
             harmonize=harmonize, guide_long=guide_long, post_cfg=post_cfg
         )
@@ -333,7 +317,7 @@ def enhance_video_file_single_gpu_onnx(device_str: str,
 def _gpu_worker_frames(gpu_id: int, args, writer_w: int, writer_h: int, in_q: mp.Queue, out_q: mp.Queue):
     device_str = f"cuda:{gpu_id}"
     try:
-        sess_step = _load_session(args.onnx_step, device_str)
+        sess = _load_session(args.onnx, device_str)
         post_cfg = dict(
             enable=args.post_enable, low_pct=args.post_low_pct, high_pct=args.post_high_pct,
             hi_pct=args.post_hi_pct, hi_strength=args.post_hi_strength, do_black=(not args.post_no_black)
@@ -344,7 +328,7 @@ def _gpu_worker_frames(gpu_id: int, args, writer_w: int, writer_h: int, in_q: mp
                 break
             idx, frame_bgr = item
             out_rgb = enhance_frame_onnx(
-                sess_step, frame_bgr, (frame_bgr.shape[1], frame_bgr.shape[0]),
+                sess, frame_bgr, (frame_bgr.shape[1], frame_bgr.shape[0]),
                 tile=args.tile_size, overlap=args.tile_overlap, tile_batch=args.tile_batch,
                 harmonize=(not args.no_harmonize), guide_long=args.guide_long, post_cfg=post_cfg
             )
@@ -378,14 +362,14 @@ def _parse_gpu_ids(gpu_ids_arg: str) -> List[int]:
     return out
 
 def main():
-    parser = argparse.ArgumentParser(description="ONNX Color Enhancement Video Test (tiled, harmonized, multi-GPU per-frame)")
+    parser = argparse.ArgumentParser(description="ONNX Color Enhancement Video Test (tiled, harmonized, multi-GPU per-frame) - single ONNX")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--onnx_step", required=True) 
+    parser.add_argument("--onnx", required=True)  
 
     parser.add_argument("--tile_size", type=int, default=512)
-    parser.add_argument("--tile_overlap", type=int, default=128) 
-    parser.add_argument("--tile_batch", type=int, default=8) 
+    parser.add_argument("--tile_overlap", type=int, default=128)
+    parser.add_argument("--tile_batch", type=int, default=8)
 
     parser.add_argument("--no_harmonize", action="store_true")
     parser.add_argument("--guide_long", type=int, default=256)
@@ -532,7 +516,7 @@ def main():
         cap.release()
 
         enhance_video_file_single_gpu_onnx(
-            device_str, args.onnx_step, src, out_dir,
+            device_str, args.onnx, src, out_dir,
             tile=args.tile_size, overlap=args.tile_overlap, tile_batch=args.tile_batch,
             guide_long=args.guide_long, harmonize=(not args.no_harmonize),
             post_cfg=post_cfg, log_every=args.log_every, show_tqdm=True
