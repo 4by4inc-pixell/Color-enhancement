@@ -36,6 +36,7 @@ def _load_session(onnx_path: str, device_str: str):
     return sess
 
 def _from_chw01_to_rgb_uint8(y):
+    y = np.nan_to_num(y, nan=0.0, posinf=1.0, neginf=0.0) # P
     y = np.clip(y, 0.0, 1.0)
     y = np.squeeze(y, 0)
     y = np.transpose(y, (1, 2, 0))
