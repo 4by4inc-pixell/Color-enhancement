@@ -36,7 +36,6 @@ def _load_session(onnx_path: str, device_str: str):
     return sess
 
 def _from_chw01_to_rgb_uint8(y):
-    y = np.nan_to_num(y, nan=0.0, posinf=1.0, neginf=0.0) # P
     y = np.clip(y, 0.0, 1.0)
     y = np.squeeze(y, 0)
     y = np.transpose(y, (1, 2, 0))
@@ -369,11 +368,11 @@ def main():
     parser.add_argument("--onnx", required=True)  
 
     parser.add_argument("--tile_size", type=int, default=512)
-    parser.add_argument("--tile_overlap", type=int, default=128)
+    parser.add_argument("--tile_overlap", type=int, default=256)
     parser.add_argument("--tile_batch", type=int, default=8)
 
     parser.add_argument("--no_harmonize", action="store_true")
-    parser.add_argument("--guide_long", type=int, default=256)
+    parser.add_argument("--guide_long", type=int, default=768)
 
     parser.add_argument("--post_enable", action="store_true")
     parser.add_argument("--post_low_pct", type=float, default=0.005)
