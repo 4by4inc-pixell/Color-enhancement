@@ -10,10 +10,9 @@ class ConvLayer(nn.Module):
     def __init__(self, in_ch, out_ch, k=3, s=1):
         super().__init__()
         p = (k - 1) // 2
-        self.pad = nn.ReflectionPad2d(p)
-        self.conv = nn.Conv2d(in_ch, out_ch, k, s, padding=0, bias=False)
+        self.conv = nn.Conv2d(in_ch, out_ch, k, s, padding=p, bias=False)
     def forward(self, x):
-        return self.conv(self.pad(x))
+        return self.conv(x)
 
 class ChannelAttention(nn.Module):
     def __init__(self, channels, reduction=16):
@@ -91,8 +90,15 @@ class Up(nn.Module):
         )
     def forward(self, x, skip):
         x = self.up(x)
-        if x.shape[2:] != skip.shape[2:]:
-            x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+        sh, sw = skip.shape[2], skip.shape[3]
+        xh, xw = x.shape[2], x.shape[3]
+        scale_h = sh / max(1, xh)
+        scale_w = sw / max(1, xw)
+        if (abs(xh - sh) + abs(xw - sw)) > 0:
+            x = F.interpolate(
+                x, scale_factor=(scale_h, scale_w),
+                mode='bilinear', align_corners=False, recompute_scale_factor=True
+            )
         x = torch.cat([x, skip], dim=1)
         return self.merge(x)
 
@@ -109,6 +115,24 @@ def ycbcr_to_rgb(ycbcr):
     g = y - 0.714*(cr - 0.5) - 0.344*(cb - 0.5)
     b = y + 1.773*(cb - 0.5)
     return torch.clamp(torch.cat([r, g, b], dim=1), 0.0, 1.0)
+
+def _approx_quantile_via_hist(Y, q: float, bins: int = 1024):
+    B, _, H, W = Y.shape
+    device = Y.device
+    edges = torch.linspace(0.0, 1.0, bins+1, device=device)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    Yexp = Y.view(B, 1, H, W)
+    ge = (Yexp >= edges[:-1].view(1, -1, 1, 1))
+    lt = (Yexp <  edges[1:].view(1, -1, 1, 1))
+    mask = (ge & lt).float()
+    mask[:, -1:, :, :] += (Yexp >= 1.0 - 1e-5).float()
+    hist = mask.sum(dim=(2, 3))
+    hist = hist / (H * W + 1e-6)
+    cdf = torch.cumsum(hist, dim=1)
+    thresh = (cdf >= q).float()
+    idx = torch.argmax(thresh, dim=1)
+    val = centers.index_select(0, idx)
+    return val.view(B, 1, 1, 1).clamp(0.0, 1.0)
 
 class ConvLSTMCell(nn.Module):
     def __init__(self, in_ch, hidden_ch, k=3):
@@ -172,10 +196,10 @@ class EnhanceParamPredictor(nn.Module):
         self.out_dim = out_dim
     def forward(self, meta_feat):
         p = self.fc(meta_feat)
-        gains   = torch.tanh(p[:, :3])  * 0.18 + 1.0     
-        biases  = torch.tanh(p[:, 3:6]) * 0.04          
-        luma_g  = torch.tanh(p[:, 6:7]) * 0.20 + 1.0   
-        chroma_g= torch.tanh(p[:, 7:8]) * 0.18 + 1.12   
+        gains   = torch.tanh(p[:, :3])  * 0.18 + 1.0
+        biases  = torch.tanh(p[:, 3:6]) * 0.04
+        luma_g  = torch.tanh(p[:, 6:7]) * 0.20 + 1.0
+        chroma_g= torch.tanh(p[:, 7:8]) * 0.18 + 1.12
         return torch.cat([gains, biases, luma_g, chroma_g], dim=1)
 
 class TemporalEnhanceUNet(nn.Module):
@@ -232,14 +256,14 @@ class RetinexVideoEnhancer(nn.Module):
     def __init__(
         self, meta_dim=64, head_out_channels=3,
         use_resolve_style=True,
-        base_lift=0.07, base_gain=1.24,          
-        base_chroma=1.14,                        
+        base_lift=0.07, base_gain=1.24,
+        base_chroma=1.14,
         use_midtone_sat=True,
         sat_mid_strength=0.04,
-        sat_mid_sigma=0.34,                      
-        skin_protect_strength=0.90,              
+        sat_mid_sigma=0.34,
+        skin_protect_strength=0.90,
         highlight_knee=0.82,
-        highlight_soft=0.40                      
+        highlight_soft=0.40
     ):
         super().__init__()
         self.meta_encoder = MetadataEncoder(out_dim=meta_dim)
@@ -260,7 +284,7 @@ class RetinexVideoEnhancer(nn.Module):
         self.register_buffer("skin_protect_strength_buf", torch.tensor(float(skin_protect_strength)))
         self.register_buffer("highlight_knee_buf",         torch.tensor(float(highlight_knee)))
         self.register_buffer("highlight_soft_buf",         torch.tensor(float(highlight_soft)))
-        
+
         self._skin_prob_prev = None
 
     def _init_meta_h(self, x, meta_dim):
@@ -271,12 +295,12 @@ class RetinexVideoEnhancer(nn.Module):
     def _auto_levels(Y, low=0.01, high=0.995, strength=0.30):
         if strength <= 1e-6:
             return Y
-        Yd = F.avg_pool2d(Y, 8, 8) if min(Y.shape[-2:]) >= 16 else Y
-        ql = torch.quantile(Yd.view(Yd.size(0), -1), low,  dim=1).view(-1,1,1,1)
-        qh = torch.quantile(Yd.view(Yd.size(0), -1), high, dim=1).view(-1,1,1,1)
+        Yd = Y
+        ql = _approx_quantile_via_hist(Yd, low)
+        qh = _approx_quantile_via_hist(Yd, high)
         eps = 1e-6
-        Ys = ((Y - ql) / (qh - ql + eps)).clamp(0,1)
-        return Y*(1.0 - strength) + Ys*strength
+        Ys = ((Y - ql) / (qh - ql + eps)).clamp(0, 1)
+        return Y * (1.0 - strength) + Ys * strength
 
     @staticmethod
     def _adaptive_skin_prob(x_rgb):
@@ -342,13 +366,15 @@ class RetinexVideoEnhancer(nn.Module):
     @staticmethod
     def _soft_shoulder(Y, knee, roll):
         t = ((Y - knee) / (roll + 1e-6)).clamp(0, 1)
-        t = t * t * (3.0 - 2.0 * t)  
+        t = t * t * (3.0 - 2.0 * t)
         return Y - t * (Y - (knee + roll))
 
     def apply_params(self, y_rgb, params):
         B = y_rgb.size(0)
-        if params.dim() == 1: params = params.unsqueeze(0)
-        if params.size(0) == 1 and B > 1: params = params.expand(B, -1)
+        if params.dim() == 1:
+            params = params.unsqueeze(0)
+        idx = torch.arange(B, device=params.device) % params.size(0)
+        params = params.index_select(0, idx)
 
         gains   = params[:, :3].view(B, 3, 1, 1)
         biases  = params[:, 3:6].view(B, 3, 1, 1)
@@ -364,24 +390,24 @@ class RetinexVideoEnhancer(nn.Module):
 
         ang_orig = torch.atan2(Cc[:,1:2], Cc[:,0:1])
 
-        if self.use_resolve_style:
-            L = self.base_lift_buf; G = self.base_gain_buf
-            Y = (Y - L).div(1.0 - L + 1e-6).clamp(0.0, 1.0)
-            Y = (Y * G).clamp(0.0, 1.0)
+        gate_rs = y.new_tensor(1.0 if self.use_resolve_style else 0.0)
+        eff_L = gate_rs * self.base_lift_buf
+        eff_G = 1.0 + gate_rs * (self.base_gain_buf - 1.0)
+        Y = (Y - eff_L).div(1.0 - eff_L + 1e-6).clamp(0.0, 1.0)
+        Y = (Y * eff_G).clamp(0.0, 1.0)
 
         Y = self._auto_levels(Y, low=0.01, high=0.995, strength=0.28)
 
         Y = (Y * luma_g).clamp(0.0, 1.0)
-        Y = self._soft_shoulder(Y, knee=float(self.highlight_knee_buf), roll=float(self.highlight_soft_buf))
+        Y = self._soft_shoulder(Y, knee=self.highlight_knee_buf, roll=self.highlight_soft_buf)
 
         chroma_total_gain = chroma_g * self.base_chroma_buf
-        if self.use_midtone_sat and float(self.sat_mid_strength_buf) > 0.0:
-            sigma = self.sat_mid_sigma_buf
-            w = torch.exp(-0.5 * ((Y - 0.5) / (sigma + 1e-6))**2)
-            chroma_total_gain = chroma_total_gain * (1.0 + self.sat_mid_strength_buf * w)
+        gate_mt = y.new_tensor(1.0 if self.use_midtone_sat else 0.0)
+        w = torch.exp(-0.5 * ((Y - 0.5) / (self.sat_mid_sigma_buf + 1e-6))**2)
+        chroma_total_gain = chroma_total_gain * (1.0 + (gate_mt * self.sat_mid_strength_buf) * w)
 
-        knee  = float(self.highlight_knee_buf)
-        soft  = float(self.highlight_soft_buf) + 1e-6
+        knee  = self.highlight_knee_buf
+        soft  = self.highlight_soft_buf + 1e-6
         hl_weight = 1.0 - ((Y - knee) / soft).clamp(0.0, 1.0)
         chroma_total_gain = 1.0 + (chroma_total_gain - 1.0) * (0.40 + 0.60 * hl_weight)
         chroma_total_gain = torch.clamp(chroma_total_gain, 0.92, 1.18)
@@ -392,8 +418,7 @@ class RetinexVideoEnhancer(nn.Module):
             skin_prob = 0.7 * prev + 0.3 * skin_prob
         self._skin_prob_prev = skin_prob.detach()
 
-        sps = float(self.skin_protect_strength_buf)
-        sps_map = sps * torch.pow(skin_prob, 0.8)
+        sps_map = (self.skin_protect_strength_buf * (skin_prob.clamp(0, 1) ** 0.8))
 
         dy = F.pad(Y[:, :, 1:] - Y[:, :, :-1], (0, 0, 0, 1))
         dx = F.pad(Y[:, :, :, 1:] - Y[:, :, :, :-1], (0, 1, 0, 0))
@@ -494,7 +519,7 @@ class RetinexEnhancer(nn.Module):
 if __name__ == "__main__":
     torch.manual_seed(0)
     x = torch.rand(2,3,128,128)
-    model = RetinexEnhancer()
+    model = RetinexEnhancer().eval()
     y, extras, _ = model(x)
     print("single:", y.shape, extras['residual'].shape, 'meta_h', extras['meta_h'].shape)
     xs = torch.rand(1,4,3,128,128)
