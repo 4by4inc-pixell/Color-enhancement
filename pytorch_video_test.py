@@ -623,10 +623,10 @@ def main():
     parser.add_argument("--log_every", type=int, default=50)
 
     parser.add_argument("--tile_size", type=int, default=512)
-    parser.add_argument("--tile_overlap", type=int, default=128)
+    parser.add_argument("--tile_overlap", type=int, default=256)
     parser.add_argument("--tile_batch", type=int, default=8)
     parser.add_argument("--no_harmonize", action="store_true")
-    parser.add_argument("--guide_long", type=int, default=256)
+    parser.add_argument("--guide_long", type=int, default=768)
 
     parser.add_argument("--post_enable", action="store_true")
     parser.add_argument("--post_low_pct", type=float, default=0.005)
