@@ -292,9 +292,9 @@ def main():
 
     ema = EMA(model.module if use_dp else model, decay=0.998)
 
-    log_dir = "logs/Color_enhancement_0916_0905"
+    log_dir = "logs/Color_enhancement_1015"
     writer = SummaryWriter(log_dir=log_dir)
-    ckpt_dir = "saved_models/Color_enhancement_0916_0905"
+    ckpt_dir = "saved_models/Color_enhancement_1015"
     os.makedirs(ckpt_dir, exist_ok=True)
 
     if AUTO_RESUME:
