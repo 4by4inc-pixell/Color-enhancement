@@ -9,16 +9,18 @@ CF_NORM     = 2.0
 FFT_WEIGHT  = 0.02
 
 class VGGPerceptualLoss(nn.Module):
-    def __init__(self, device):
+    def __init__(self):
         super().__init__()
-        vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features[:16].to(device).eval()
+        vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features[:16].eval()
         for p in vgg.parameters():
             p.requires_grad = False
         self.vgg = vgg
         self.register_buffer('mean', torch.tensor([0.485,0.456,0.406]).view(1,3,1,1))
         self.register_buffer('std',  torch.tensor([0.229,0.224,0.225]).view(1,3,1,1))
+
     def forward(self, x, y):
-        mean = self.mean.to(x.device); std = self.std.to(x.device)
+        mean = self.mean.to(x.device)
+        std  = self.std.to(x.device)
         x_n = (x.float() - mean) / std
         y_n = (y.float() - mean) / std
         return F.mse_loss(self.vgg(x_n), self.vgg(y_n))
@@ -77,7 +79,7 @@ def edge_preserve_loss(y_pred, x_ref):
     gi = sobel_grad(gray(x_ref))
     return F.l1_loss(gp, gi)
 
-def clipping_avoid_loss(img, lo=0.01, hi=0.985):  
+def clipping_avoid_loss(img, lo=0.01, hi=0.99):
     under = (lo - img).clamp(min=0)
     over  = (img - hi).clamp(min=0)
     return (under.mean() + over.mean())
@@ -170,34 +172,28 @@ def skin_mask(x):
     cr_min, cr_max = 133/255.0, 173/255.0
     return ((cb >= cb_min) & (cb <= cb_max) & (cr >= cr_min) & (cr <= cr_max)).float()
 
-def _hue_angle(x):
-    ycc = _rgb_to_ycbcr(x)
-    Cb = ycc[:,1:2] - 0.5
-    Cr = ycc[:,2:3] - 0.5
-    return torch.atan2(Cr, Cb)  
-
-def _angle_l1(a, b):
-    d = torch.atan2(torch.sin(a-b), torch.cos(a-b))
-    return d.abs()
-
-def skin_hue_preserve_loss(y_pred, ref, sm=None):
-    ang_p = _hue_angle(y_pred)
-    ang_r = _hue_angle(ref)
-    diff = _angle_l1(ang_p, ang_r)
-    if sm is not None:
-        w = sm
-        return (diff * w).sum() / (w.sum() + 1e-6)
-    return diff.mean()
-
-def enhancement_loss(y_pred, y_true, extras, device, x_input=None, light=False):
+def enhancement_loss(
+    y_pred,
+    y_true,
+    extras,
+    device,
+    x_input=None,
+    light=False,
+    vgg_loss: VGGPerceptualLoss = None,   
+):
     l1    = F.l1_loss(y_pred, y_true)
     ssim_ = 0.0
-    perc  = 0.0
     freq  = 0.0
-    if not light:
-        perc  = VGGPerceptualLoss(device)(y_pred, y_true)
-        ssim_ = ssim_loss(y_pred, y_true)
+
+    if (not light) and (vgg_loss is not None):
+        perc = vgg_loss(y_pred, y_true)
+        try:
+            ssim_ = ssim_loss(y_pred, y_true)
+        except Exception:
+            ssim_ = 0.0
         freq  = frequency_loss(y_pred, y_true)
+    else:
+        perc = 0.0
 
     Lp, ap, bp = lab_split(y_pred)
     Lt, at, bt = lab_split(y_true)
@@ -213,7 +209,7 @@ def enhancement_loss(y_pred, y_true, extras, device, x_input=None, light=False):
     edge_to_gt  = edge_preserve_loss(y_pred, y_true)
     edge_to_inp = edge_preserve_loss(y_pred, x_input if x_input is not None else y_true)
 
-    clip  = clipping_avoid_loss(y_pred, lo=0.01, hi=0.985)
+    clip  = clipping_avoid_loss(y_pred)
     tv    = tv_loss(y_pred)
 
     if x_input is not None:
@@ -245,26 +241,32 @@ def enhancement_loss(y_pred, y_true, extras, device, x_input=None, light=False):
     if mask is not None:
         mask_l1, mask_tv = mask_reg_losses(mask)
 
-    id_weight = torch.exp(-20.0 * F.mse_loss(x_input, y_true, reduction='none').mean(dim=[1,2,3])).mean() if x_input is not None else 0.0
+    id_weight = torch.exp(
+        -20.0 * F.mse_loss(x_input, y_true, reduction='none').mean(dim=[1,2,3])
+    ).mean() if x_input is not None else 0.0
     id_preserve =  F.l1_loss(y_pred, x_input) * id_weight if x_input is not None else 0.0
 
     sm = skin_mask(x_input if x_input is not None else y_true)
-    skin_hue = skin_hue_preserve_loss(y_pred, y_true, sm)
-
-    gains = extras.get('gains', None)
-    biases = extras.get('biases', None)
-    tint_reg = torch.tensor(0.0, device=y_pred.device)
-    if gains is not None:
-        gr, gg, gb = gains[:,0], gains[:,1], gains[:,2]
-        tint_reg = tint_reg + (gr-gg).abs().mean() + (gg-gb).abs().mean()
-    if biases is not None:
-        br, bg, bb = biases[:,0], biases[:,1], biases[:,2]
-        tint_reg = tint_reg + (br-bg).abs().mean() + (bg-bb).abs().mean()
+    if sm.mean() > 0:
+        def masked_mean_lab(img):
+            L,a,b = lab_split(img)
+            m = sm
+            eps = 1e-6
+            return (L*m).sum()/(m.sum()+eps), (a*m).sum()/(m.sum()+eps), (b*m).sum()/(m.sum()+eps)
+        Lp_m, ap_m, bp_m = masked_mean_lab(y_pred)
+        Lt_m, at_m, bt_m = masked_mean_lab(y_true)
+        skin_lab = (
+            (Lp_m-Lt_m).abs()/(LAB_L_NORM) +
+            (ap_m-at_m).abs()/(LAB_AB_NORM) +
+            (bp_m-bt_m).abs()/(LAB_AB_NORM)
+        )
+    else:
+        skin_lab = torch.tensor(0.0, device=y_pred.device)
 
     total_loss = (
         0.30 * l1 +
-        (0.02 if not light else 0.0) * perc +
-        (0.08 if not light else 0.0) * (ssim_ if not isinstance(ssim_, float) else 0.0) +
+        (0.02 if (not light and not isinstance(perc, float)) else 0.0) * (perc if not isinstance(perc, float) else 0.0) +
+        (0.08 if (not light and not isinstance(ssim_, float)) else 0.0) * (ssim_ if not isinstance(ssim_, float) else 0.0) +
         0.08 * lab_L +
         0.14 * lab_ab +
         0.06 * luma_match +
@@ -273,9 +275,9 @@ def enhancement_loss(y_pred, y_true, extras, device, x_input=None, light=False):
         0.05 * cf +
         0.05 * edge_to_gt +
         0.02 * edge_to_inp +
-        0.05 * clip +     
+        0.02 * clip +
         0.02 * tv +
-        (FFT_WEIGHT if not light else 0.0) * (freq if not isinstance(freq, float) else 0.0) +
+        (FFT_WEIGHT if (not light and not isinstance(freq, float)) else 0.0) * (freq if not isinstance(freq, float) else 0.0) +
         0.02 * exp +
         0.04 * chroma_contrast +
         0.06 * cond_boost +
@@ -283,7 +285,6 @@ def enhancement_loss(y_pred, y_true, extras, device, x_input=None, light=False):
         0.005 * mask_l1 +
         0.01  * mask_tv +
         0.05  * id_preserve +
-        0.03  * skin_hue +   
-        0.03  * tint_reg    
+        0.03  * skin_lab
     )
     return total_loss
