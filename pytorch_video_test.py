@@ -1,17 +1,29 @@
 import sys
 import argparse
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional
 import numpy as np
 import torch
 import cv2
 from tqdm import tqdm
 import multiprocessing as mp
-import module as md
+import shutil
 from model import RetinexEnhancer
+from compat import ensure_registered_buffers, load_compat_ckpt
 
 def is_video(p: Path):
-    return p.suffix.lower() in [".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg"]
+    return p.suffix.lower() in [
+        ".mp4",
+        ".mov",
+        ".m4v",
+        ".avi",
+        ".mkv",
+        ".webm",
+        ".mpg",
+        ".mpeg",
+        ".wmv",
+        ".flv",
+    ]
 
 def _parse_gpu_ids(gpu_ids_arg: str) -> List[int]:
     ids = []
@@ -39,7 +51,7 @@ def _open_video_writer(out_path: Path, fps: float, w: int, h: int):
         four = cv2.VideoWriter_fourcc(*fcc)
         vw = cv2.VideoWriter(str(out_path), four, fps, (writer_w, writer_h))
         if vw.isOpened():
-            note = "" if (writer_w, writer_h) == (w, h) else f" (even {writer_w}x{writer_h})"
+            note = "" if (writer_w == w and writer_h == h) else f" (even {writer_w}x{writer_h})"
             print(f"[Writer] fourcc={fcc} {w}x{h}{note} → {out_path.name}")
             return vw, (writer_w, writer_h)
         vw.release()
@@ -51,85 +63,11 @@ def _open_video_writer(out_path: Path, fps: float, w: int, h: int):
         return vw, (writer_w, writer_h)
     return None, (writer_w, writer_h)
 
-def _safe_load_state(path, device):
-    obj = torch.load(path, map_location=device, weights_only=False)
-    if isinstance(obj, dict):
-        if "model_state" in obj and isinstance(obj["model_state"], dict):
-            return obj["model_state"]
-        if "state_dict" in obj and isinstance(obj["state_dict"], dict):
-            return obj["state_dict"]
-    return obj
-
-def _strip_dataparallel(sd):
-    if any(k.startswith("module.") for k in sd.keys()):
-        sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
-    return sd
-
-def _remap_legacy_keys(sd):
-    rules = [
-        ("a_encoder.", "net.meta_encoder."),
-        ("a_gru.", "net.meta_gru."),
-        ("am_predictor.", "net.param_predictor."),
-        ("e.", "net.core."),
-    ]
-    out = {}
-    for k, v in sd.items():
-        nk = k
-        for old, new in rules:
-            if nk.startswith(old):
-                nk = nk.replace(old, new, 1)
-        out[nk] = v
-    return out
-
-def ensure_registered_buffers(model: RetinexEnhancer):
-    if not hasattr(model, "net"):
-        return model
-    net = model.net
-    for name, val in [
-        ("sat_mid_sigma_buf", 0.34),
-        ("sat_mid_strength_buf", 0.04),
-        ("base_chroma_buf", 1.14),
-        ("base_gain_buf", 1.24),
-        ("base_lift_buf", 0.07),
-        ("skin_protect_strength_buf", 0.90),
-        ("highlight_knee_buf", 0.82),
-        ("highlight_soft_buf", 0.40),
-    ]:
-        if not hasattr(net, name):
-            net.register_buffer(name, torch.tensor(float(val)))
-    if not hasattr(net, "use_midtone_sat"):
-        net.use_midtone_sat = True
-    if not hasattr(net, "use_resolve_style"):
-        net.use_resolve_style = True
-    return model
-
-def load_compat_ckpt(model, ckpt_path, device):
-    state = _safe_load_state(ckpt_path, device)
-    if not isinstance(state, dict):
-        raise RuntimeError(f"bad state: {type(state)}")
-    state = _strip_dataparallel(state)
-    state = _remap_legacy_keys(state)
-    ensure_registered_buffers(model)
-    info = model.load_state_dict(state, strict=False)
-    with torch.no_grad():
-        if hasattr(model, "net"):
-            net = model.net
-            net.base_gain_buf.fill_(1.24)
-            net.base_lift_buf.fill_(0.07)
-            net.base_chroma_buf.fill_(1.14)
-            net.sat_mid_strength_buf.fill_(0.04)
-            net.sat_mid_sigma_buf.fill_(0.34)
-            net.skin_protect_strength_buf.fill_(0.90)
-            net.highlight_knee_buf.fill_(0.82)
-            net.highlight_soft_buf.fill_(0.40)
-            net.use_midtone_sat = True
-            net.use_resolve_style = True
-    return model
-
 class TorchRunner:
-    def __init__(self, ckpt_path: str, device: str = "cuda:0"):
+    def __init__(self, ckpt_path: str, device: str = "cuda:0", window_size: int = 3):
         self.device = torch.device(device if device != "cpu" else "cpu")
-        self.model = RetinexEnhancer().to(self.device)
+        self.window_size = window_size
+        self.model = RetinexEnhancer(window_size=self.window_size).to(self.device)
         ensure_registered_buffers(self.model)
         load_compat_ckpt(self.model, ckpt_path, self.device)
         try:
@@ -144,126 +82,75 @@ class TorchRunner:
         xb = torch.from_numpy(x_bchw_f01_rgb).to(self.device, dtype=torch.float32)
         xb = xb.contiguous(memory_format=torch.channels_last)
         y, _, _ = self.model(xb, None, None, True)
-        y = y.clamp(0, 1).detach().cpu().numpy().astype(np.float32, copy=False)
+        y = y.detach().cpu().numpy().astype(np.float32, copy=False)
         return y
 
-def _process_single_video_on_one_gpu(
+def _build_window_stack(frames: List[np.ndarray], t: int, window_size: int) -> np.ndarray:
+    half_w = window_size // 2
+    H, W = frames[0].shape[:2]
+    imgs = []
+    for dt in range(-half_w, half_w + 1):
+        tt = t + dt
+        if tt < 0:
+            tt = 0
+        if tt >= len(frames):
+            tt = len(frames) - 1
+        frame_bgr = frames[tt]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        rgb_f01 = rgb.astype(np.float32) / 255.0
+        imgs.append(rgb_f01)
+    stack_hwc = np.concatenate(imgs, axis=2)
+    x_bchw = np.transpose(stack_hwc, (2, 0, 1))[None, ...]
+    return x_bchw
+
+def _process_video_chunk_worker(
     gpu_id: Optional[int],
     ckpt_path: str,
-    src: Path,
-    out_dir: Path,
-    tile: int,
-    overlap: int,
-    pad_stride: int,
-    guide_long: int,
-    guide_multiple_of: int,
-    batch_size: int,
+    src_path: str,
+    tmp_dir: str,
+    start_idx: int,
+    end_idx: int,
+    window_size: int,
 ):
     device = f"cuda:{gpu_id}" if gpu_id is not None else "cpu"
-    runner = TorchRunner(ckpt_path, device)
-    pipe_cfg = md.PipelineCfg(
-        tile=tile,
-        overlap=overlap,
-        use_pad_reflect101=True,
-        pad_stride=pad_stride,
-        use_hann_merge=True,
-        use_harmonize=True,
-        guide_long=guide_long,
-        guide_multiple_of=guide_multiple_of,
-    )
+    runner = TorchRunner(ckpt_path, device=device, window_size=window_size)
+    src = Path(src_path)
     cap = cv2.VideoCapture(str(src))
-    if not cap.isOpened():
-        print(f"[Skip] Cannot open video: {src}")
-        return
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    N = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    out_path = out_dir / f"enhanced_{src.stem}{src.suffix}"
-    vw, (writer_w, writer_h) = _open_video_writer(out_path, fps, W, H)
-    if vw is None:
-        cap.release()
-        print(f"[Error] Could not create VideoWriter: {out_path}")
-        return
-    pbar = tqdm(total=N if N > 0 else 0, desc=f"{src.name} @GPU[{device}]", unit="frame", disable=(N <= 0))
+    frames: List[np.ndarray] = []
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        out_bgr = md.process_image_like_onnx_pytorch(
-            frame,
-            runner,
-            pipe_cfg,
-            input_is_bgr=True,
-        )
-        if (writer_w, writer_h) != (out_bgr.shape[1], out_bgr.shape[0]):
-            pad_h = (2 - (out_bgr.shape[0] % 2)) % 2
-            pad_w = (2 - (out_bgr.shape[1] % 2)) % 2
-            out_bgr = cv2.copyMakeBorder(out_bgr, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0,0,0))
-        vw.write(out_bgr)
-        if N > 0:
-            pbar.update(1)
-    pbar.close()
-    vw.release()
+        frames.append(frame)
     cap.release()
+    if not frames:
+        print(f"[Worker {device}] no frames in video {src}")
+        return
+    tmp_dir_path = Path(tmp_dir)
+    tmp_dir_path.mkdir(parents=True, exist_ok=True)
+    local_start = start_idx
+    local_end = min(end_idx, len(frames))
+    for t in tqdm(
+        range(local_start, local_end),
+        desc=f"{src.name} {device} [{local_start}-{local_end})",
+        unit="frame",
+    ):
+        x_window = _build_window_stack(frames, t, window_size)
+        y = runner(x_window)
+        y0 = y[0]
+        y_hwc = np.transpose(y0, (1, 2, 0))
+        y_hwc = np.clip(y_hwc, 0.0, 1.0)
+        out_rgb = (y_hwc * 255.0 + 0.5).astype(np.uint8)
+        out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+        out_path = tmp_dir_path / f"frame_{t:08d}.png"
+        cv2.imwrite(str(out_path), out_bgr)
 
-def _frame_worker(
-    gpu_id: int,
-    ckpt_path: str,
-    tile: int,
-    overlap: int,
-    pad_stride: int,
-    guide_long: int,
-    guide_multiple_of: int,
-    batch_size: int,
-    in_q: mp.Queue,
-    out_q: mp.Queue,
-    writer_w: int,
-    writer_h: int,
-):
-    device = f"cuda:{gpu_id}"
-    try:
-        runner = TorchRunner(ckpt_path, device)
-        pipe_cfg = md.PipelineCfg(
-            tile=tile,
-            overlap=overlap,
-            use_pad_reflect101=True,
-            pad_stride=pad_stride,
-            use_hann_merge=True,
-            use_harmonize=True,
-            guide_long=guide_long,
-            guide_multiple_of=guide_multiple_of,
-        )
-        while True:
-            item = in_q.get()
-            if item is None:
-                break
-            idx, frame = item
-            out_bgr = md.process_image_like_onnx_pytorch(frame, runner, pipe_cfg, input_is_bgr=True)
-            if (writer_w, writer_h) != (out_bgr.shape[1], out_bgr.shape[0]):
-                pad_h = (2 - (out_bgr.shape[0] % 2)) % 2
-                pad_w = (2 - (out_bgr.shape[1] % 2)) % 2
-                out_bgr = cv2.copyMakeBorder(out_bgr, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0,0,0))
-            out_q.put((idx, out_bgr))
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        print(f"[Worker cuda:{gpu_id}] error: {e}")
-    finally:
-        out_q.put(None)
-
-def _process_single_video_multi_gpu_frames(
+def _process_single_video_multi_gpu(
     gpu_ids: List[int],
     ckpt_path: str,
     src: Path,
     out_dir: Path,
-    tile: int,
-    overlap: int,
-    pad_stride: int,
-    guide_long: int,
-    guide_multiple_of: int,
-    batch_size: int,
-    queue_size: int = 64,
+    window_size: int = 3,
 ):
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
@@ -273,90 +160,184 @@ def _process_single_video_multi_gpu_frames(
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     N = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    out_path = out_dir / f"enhanced_{src.stem}{src.suffix}"
-    vw, (writer_w, writer_h) = _open_video_writer(out_path, fps, W, H)
-    if vw is None:
-        cap.release()
-        print(f"[Error] Could not create VideoWriter: {out_path}")
+
+    frames_count = 0
+    while True:
+        ok, _ = cap.read()
+        if not ok:
+            break
+        frames_count += 1
+    cap.release()
+    if N <= 0:
+        N = frames_count
+    if N <= 0:
+        print(f"[Skip] No frames in video: {src}")
         return
-    in_q = mp.Queue(maxsize=max(2, queue_size))
-    out_q = mp.Queue(maxsize=max(2, queue_size))
+
+    out_path = out_dir / f"enhanced_{src.stem}{src.suffix}"
+    tmp_dir = out_dir / f"tmp_frames_{src.stem}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    num_gpus = len(gpu_ids)
+    chunk_size = (N + num_gpus - 1) // num_gpus
     procs = []
-    for gid in gpu_ids:
+    for i, gid in enumerate(gpu_ids):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, N)
+        if start_idx >= end_idx:
+            continue
         p = mp.Process(
-            target=_frame_worker,
-            args=(gid, ckpt_path, tile, overlap, pad_stride, guide_long, guide_multiple_of, batch_size, in_q, out_q, writer_w, writer_h),
+            target=_process_video_chunk_worker,
+            args=(
+                gid,
+                ckpt_path,
+                str(src),
+                str(tmp_dir),
+                start_idx,
+                end_idx,
+                window_size,
+            ),
             daemon=True,
         )
         p.start()
         procs.append(p)
-    pbar = tqdm(total=N if N > 0 else 0, desc=f"{src.name} multi-GPU {gpu_ids}", unit="frame", disable=(N <= 0))
-    next_write = 0
-    buffer: Dict[int, np.ndarray] = {}
-    finished_workers = 0
-    idx = 0
+    for p in procs:
+        p.join()
+
+    vw, (writer_w, writer_h) = _open_video_writer(out_path, fps, W, H)
+    if vw is None:
+        print(f"[Error] Could not create VideoWriter: {out_path}")
+        return
+
+    alpha = 0.85
+    prev_bgr = None
+
+    for t in tqdm(range(N), desc=f"{src.name} write", unit="frame"):
+        fpath = tmp_dir / f"frame_{t:08d}.png"
+        img = cv2.imread(str(fpath), cv2.IMREAD_COLOR)
+        if img is None:
+            img = np.zeros((H, W, 3), dtype=np.uint8)
+
+        if prev_bgr is None:
+            smooth = img
+        else:
+            smooth = (alpha * img.astype(np.float32) +
+                      (1.0 - alpha) * prev_bgr.astype(np.float32)).astype(np.uint8)
+
+        prev_bgr = smooth
+
+        if (writer_w, writer_h) != (smooth.shape[1], smooth.shape[0]):
+            pad_h = (2 - (smooth.shape[0] % 2)) % 2
+            pad_w = (2 - (smooth.shape[1] % 2)) % 2
+            smooth_padded = cv2.copyMakeBorder(
+                smooth, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            )
+        else:
+            smooth_padded = smooth
+
+        vw.write(smooth_padded)
+
+    vw.release()
+    try:
+        shutil.rmtree(tmp_dir)
+    except Exception as e:
+        print(f"[Warning] Could not remove tmp directory: {tmp_dir} ({e})")
+
+def _process_single_video_single_gpu(
+    gpu_id: Optional[int],
+    ckpt_path: str,
+    src: Path,
+    out_dir: Path,
+    window_size: int = 3,
+):
+    device = f"cuda:{gpu_id}" if gpu_id is not None else "cpu"
+    runner = TorchRunner(ckpt_path, device=device, window_size=window_size)
+    cap = cv2.VideoCapture(str(src))
+    if not cap.isOpened():
+        print(f"[Skip] Cannot open video: {src}")
+        return
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    N = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    frames: List[np.ndarray] = []
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        in_q.put((idx, frame))
-        idx += 1
-        while not out_q.empty():
-            item = out_q.get()
-            if item is None:
-                finished_workers += 1
-                continue
-            i, f = item
-            buffer[i] = f
-            while next_write in buffer:
-                vw.write(buffer.pop(next_write))
-                next_write += 1
-                if N > 0:
-                    pbar.update(1)
-    for _ in procs:
-        in_q.put(None)
-    while finished_workers < len(procs) or buffer:
-        item = out_q.get()
-        if item is None:
-            finished_workers += 1
-            continue
-        i, f = item
-        buffer[i] = f
-        while next_write in buffer:
-            vw.write(buffer.pop(next_write))
-            next_write += 1
-            if N > 0:
-                pbar.update(1)
+        frames.append(frame)
+    cap.release()
+    if not frames:
+        print(f"[Skip] No frames in video: {src}")
+        return
+    if N <= 0:
+        N = len(frames)
+
+    out_path = out_dir / f"enhanced_{src.stem}{src.suffix}"
+    vw, (writer_w, writer_h) = _open_video_writer(out_path, fps, W, H)
+    if vw is None:
+        print(f"[Error] Could not create VideoWriter: {out_path}")
+        return
+
+    pbar = tqdm(total=N, desc=f"{src.name} @GPU[{device}]", unit="frame")
+
+    alpha = 0.85
+    prev_bgr = None
+
+    for t in range(len(frames)):
+        x_window = _build_window_stack(frames, t, window_size)
+        y = runner(x_window)
+        y0 = y[0]
+        y_hwc = np.transpose(y0, (1, 2, 0))
+        y_hwc = np.clip(y_hwc, 0.0, 1.0)
+        out_rgb = (y_hwc * 255.0 + 0.5).astype(np.uint8)
+        out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+
+        if prev_bgr is None:
+            smooth = out_bgr
+        else:
+            smooth = (alpha * out_bgr.astype(np.float32) +
+                      (1.0 - alpha) * prev_bgr.astype(np.float32)).astype(np.uint8)
+
+        prev_bgr = smooth
+
+        if (writer_w, writer_h) != (smooth.shape[1], smooth.shape[0]):
+            pad_h = (2 - (smooth.shape[0] % 2)) % 2
+            pad_w = (2 - (smooth.shape[1] % 2)) % 2
+            smooth_padded = cv2.copyMakeBorder(
+                smooth, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            )
+        else:
+            smooth_padded = smooth
+
+        vw.write(smooth_padded)
+        pbar.update(1)
     pbar.close()
     vw.release()
-    cap.release()
-    for p in procs:
-        p.join()
 
 def main():
-    ap = argparse.ArgumentParser(description="PyTorch Video Inference (multi-GPU) via module.py")
+    ap = argparse.ArgumentParser(description="PyTorch Video Inference (temporal window, multi-GPU, EMA smoothing)")
     ap.add_argument("--input", required=True)
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--gpu_ids", type=str, default="")
-    
     ap.add_argument("--tile", type=int, default=512)
     ap.add_argument("--overlap", type=int, default=128)
     ap.add_argument("--batch", type=int, default=8)
-    
     ap.add_argument("--pad_stride", type=int, default=8)
-    
-    ap.add_argument("--guide_long", type=int, default=768)
+    ap.add_argument("--guide_long", type=int, default=384)
     ap.add_argument("--guide_multiple_of", type=int, default=8)
     ap.add_argument("--queue_size", type=int, default=64)
     args = ap.parse_args()
-
     in_path = Path(args.input)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
     if in_path.is_dir():
-        targets = sorted([p for p in in_path.iterdir() if p.is_file() and is_video(p)], key=lambda p: p.name.lower())
+        targets = sorted(
+            [p for p in in_path.iterdir() if p.is_file() and is_video(p)],
+            key=lambda p: p.name.lower(),
+        )
     else:
         if not is_video(in_path):
             print(f"Input is not a recognized video: {in_path}")
@@ -365,9 +346,17 @@ def main():
     if not targets:
         print("No video to process.")
         sys.exit(0)
-
     gpu_ids = _parse_gpu_ids(args.gpu_ids)
-
+    if len(targets) == 1 and len(gpu_ids) >= 2:
+        _process_single_video_multi_gpu(
+            gpu_ids,
+            args.ckpt,
+            targets[0],
+            out_dir,
+            window_size=3,
+        )
+        print("[Video] Complete")
+        return
     if len(targets) > 1 and gpu_ids:
         chunks = [[] for _ in range(len(gpu_ids))]
         for i, p in enumerate(targets):
@@ -378,8 +367,14 @@ def main():
                 continue
             for src in subset:
                 p = mp.Process(
-                    target=_process_single_video_on_one_gpu,
-                    args=(gpu_id, args.ckpt, src, out_dir, args.tile, args.overlap, args.pad_stride, args.guide_long, args.guide_multiple_of, args.batch),
+                    target=_process_single_video_single_gpu,
+                    args=(
+                        gpu_id,
+                        args.ckpt,
+                        src,
+                        out_dir,
+                        3,
+                    ),
                     daemon=True,
                 )
                 p.start()
@@ -388,20 +383,14 @@ def main():
             p.join()
         print("[Video] Complete")
         return
-
-    if len(targets) == 1 and len(gpu_ids) >= 2:
-        _process_single_video_multi_gpu_frames(
-            gpu_ids, args.ckpt, targets[0], out_dir,
-            args.tile, args.overlap, args.pad_stride, args.guide_long, args.guide_multiple_of, args.batch, args.queue_size
-        )
-        print("[Video] Complete")
-        return
-
     gpu = gpu_ids[0] if gpu_ids else None
     for src in targets:
-        _process_single_video_on_one_gpu(
-            gpu, args.ckpt, src, out_dir,
-            args.tile, args.overlap, args.pad_stride, args.guide_long, args.guide_multiple_of, args.batch
+        _process_single_video_single_gpu(
+            gpu,
+            args.ckpt,
+            src,
+            out_dir,
+            3,
         )
     print("[Video] Complete")
 
