@@ -11,7 +11,7 @@ def calculate_ssim(img1, img2, max_pixel_value=1.0):
     try:
         import torchmetrics
         return float(torchmetrics.functional.structural_similarity_index_measure(
-            img1, img2, data_range=max_pixel_value, gaussian_kernel=True
+            img1, img2, data_range=max_pixel_value
         ).item())
     except Exception:
         return 0.0
