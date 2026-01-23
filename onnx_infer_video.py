@@ -44,9 +44,12 @@ def parse_args():
 
     p.add_argument("--frame_batch", type=int, default=4)
     p.add_argument("--queue_max", type=int, default=12)
-    p.add_argument("--sample_n", type=int, default=5)
 
     p.add_argument("--multi_gpu_single_video", action="store_true")
+
+    p.add_argument("--scene_threshold", type=float, default=27.0)
+    p.add_argument("--scene_min_len", type=int, default=15)
+    p.add_argument("--scene_global_frame", type=str, default="mid", choices=["start", "mid"])
     return p.parse_args()
 
 def ensure_dir(path: str):
@@ -74,7 +77,7 @@ def choose_out_path(out_dir, epoch, in_name, out_ext):
         ext2 = out_ext if out_ext.startswith(".") else "." + out_ext
     else:
         ext2 = ext
-    out_name = f"ONNX_enhance_epoch{int(epoch)}_{stem}{ext2}"
+    out_name = f"ONNX_enhance_{stem}{ext2}"
     return os.path.join(out_dir, out_name)
 
 def open_writer(out_path, w, h, fps, codec):
@@ -133,7 +136,7 @@ def safe_pad_replicate(x: np.ndarray, pad_l: int, pad_r: int, pad_t: int, pad_b:
         mode="edge",
     )
 
-def pad_to_stride_replicate(x: np.ndarray, stride: int) -> tuple[np.ndarray, int, int]:
+def pad_to_stride_replicate(x: np.ndarray, stride: int):
     if stride is None or int(stride) <= 1:
         return x, 0, 0
     stride = int(stride)
@@ -239,57 +242,113 @@ def tile_inference_blend_onnx(session: ort.InferenceSession, x_full: np.ndarray,
     out = out_sum / (w_sum + 1e-8)
     return np.clip(out, 0.0, 1.0)
 
-def estimate_global_input_from_samples(in_path: str, max_side: int, sample_n: int) -> np.ndarray:
+def detect_scenes_with_pyscenedetect(video_path: str, threshold: float, min_scene_len: int):
+    try:
+        from scenedetect import open_video, SceneManager
+        from scenedetect.detectors import ContentDetector
+    except Exception:
+        return None
+    video = open_video(video_path)
+    scene_manager = SceneManager()
+    scene_manager.add_detector(ContentDetector(threshold=float(threshold), min_scene_len=int(min_scene_len)))
+    scene_manager.detect_scenes(video=video)
+    scene_list = scene_manager.get_scene_list()
+    scenes = []
+    for start_time, end_time in scene_list:
+        s = start_time.get_frames()
+        e = end_time.get_frames()
+        if e > s:
+            scenes.append((int(s), int(e)))
+    return scenes if scenes else None
+
+def default_single_scene(frame_count: int):
+    if frame_count and frame_count > 0:
+        return [(0, int(frame_count))]
+    return [(0, -1)]
+
+def build_scene_globals(in_path: str, global_max_side: int, scene_threshold: float, scene_min_len: int, scene_global_frame: str):
     cap = cv2.VideoCapture(in_path)
     if not cap.isOpened():
         raise RuntimeError(f"cannot open video: {in_path}")
-
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.get(cv2.CAP_PROP_FRAME_COUNT) else 0
-    if frame_count and frame_count > 0:
-        idxs = np.linspace(0, max(0, frame_count - 1), num=max(1, int(sample_n))).round().astype(int).tolist()
-        idxs = sorted(set(int(i) for i in idxs))
-    else:
-        idxs = [0]
 
-    acc = None
-    got = 0
+    scenes = detect_scenes_with_pyscenedetect(in_path, scene_threshold, scene_min_len)
+    if scenes is None:
+        scenes = default_single_scene(frame_count)
 
-    for fi in idxs:
+    print(
+        f"[SceneDetect] video={os.path.basename(in_path)} scenes={len(scenes)} "
+        f"threshold={float(scene_threshold)} min_len={int(scene_min_len)} pick={str(scene_global_frame)} "
+        f"global_max_side={int(global_max_side)}",
+        flush=True,
+    )
+
+    scene_globals = []
+    for si, (s, e) in enumerate(scenes):
+        if e < 0 or e <= s:
+            fi = int(s)
+        else:
+            fi = int(s) if scene_global_frame == "start" else int(s + (e - s) // 2)
+
+        if e < 0:
+            print(f"  scene[{si:03d}] frames [{int(s)}, end) pick_frame={int(fi)}", flush=True)
+        else:
+            print(f"  scene[{si:03d}] frames [{int(s)}, {int(e)}) len={int(e - s)} pick_frame={int(fi)}", flush=True)
+
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
         ok, frame = cap.read()
         if not ok:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(s))
+            ok, frame = cap.read()
+        if not ok:
             continue
-        x = bgr_to_numpy_rgb01(frame)
-        xg = resize_max_side_rgb01(x, int(max_side))
-        if acc is None:
-            acc = np.zeros_like(xg, dtype=np.float32)
-        if acc.shape != xg.shape:
-            h0, w0 = acc.shape[-2], acc.shape[-1]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            resized = cv2.resize(rgb, (w0, h0), interpolation=cv2.INTER_CUBIC)
-            xg = np.transpose(resized.astype(np.float32) / 255.0, (2, 0, 1))[None, ...]
-        acc += xg.astype(np.float32)
-        got += 1
+        x_full = bgr_to_numpy_rgb01(frame).astype(np.float32)
+        x_global = resize_max_side_rgb01(x_full, int(global_max_side)).astype(np.float32)
+        scene_globals.append((x_global, int(s), int(e)))
 
+    if len(scene_globals) == 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, frame = cap.read()
+        if not ok:
+            cap.release()
+            raise RuntimeError("cannot read first frame for global context")
+        x_full = bgr_to_numpy_rgb01(frame).astype(np.float32)
+        x_global = resize_max_side_rgb01(x_full, int(global_max_side)).astype(np.float32)
+        scene_globals = [(x_global, 0, -1)]
+        print("  [SceneDetect] fallback single scene [0, end) pick_frame=0", flush=True)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     cap.release()
+    return scene_globals
 
-    if acc is None or got <= 0:
-        raise RuntimeError(f"failed to sample frames: {in_path}")
+def scene_id_for_frame(fi: int, scenes: list[tuple[int, int]]):
+    for i, (s, e) in enumerate(scenes):
+        if e < 0:
+            if fi >= s:
+                return i
+        else:
+            if s <= fi < e:
+                return i
+    if len(scenes) > 0:
+        return len(scenes) - 1
+    return 0
 
-    acc /= float(got)
-    return np.clip(acc, 0.0, 1.0).astype(np.float32)
-
-def worker_loop_single_video(local_gpu_id: int, onnx_path: str, providers: str, tile: int, halo: int, pad_stride: int, x_global: np.ndarray, in_q, out_q):
+def worker_loop_single_video(local_gpu_id: int, onnx_path: str, providers: str, tile: int, halo: int, pad_stride: int, scene_globals, in_q, out_q):
     if providers == "cuda":
         session = build_session(onnx_path, "cuda", int(local_gpu_id))
     else:
         session = build_session(onnx_path, "cpu", 0)
 
+    globals_only = [g for (g, _, _) in scene_globals]
+
     while True:
         item = in_q.get()
         if item is None:
             break
-        batch_id, frames_bgr = item
+        batch_id, frames_bgr, scene_id = item
+        sid = int(scene_id)
+        sid = max(0, min(sid, len(globals_only) - 1))
+        x_global = globals_only[sid]
         outs = []
         for f in frames_bgr:
             x_full = bgr_to_numpy_rgb01(f).astype(np.float32)
@@ -304,7 +363,7 @@ def worker_loop_single_video(local_gpu_id: int, onnx_path: str, providers: str, 
             outs.append(numpy_rgb01_to_bgr_u8(pred))
         out_q.put((batch_id, outs))
 
-def process_one_video_multi_gpu_single_video(args, in_path: str, out_path: str, local_gpu_ids: list[int]) -> str:
+def process_one_video_multi_gpu_single_video(args, in_path: str, out_path: str, local_gpu_ids):
     cap = cv2.VideoCapture(in_path)
     if not cap.isOpened():
         raise RuntimeError(f"cannot open video: {in_path}")
@@ -327,11 +386,14 @@ def process_one_video_multi_gpu_single_video(args, in_path: str, out_path: str, 
             raise RuntimeError(f"cannot open VideoWriter for: {out_path}")
         out_path = out_path2
 
-    x_global = estimate_global_input_from_samples(
+    scene_globals = build_scene_globals(
         in_path=in_path,
-        max_side=int(args.global_max_side),
-        sample_n=int(args.sample_n),
+        global_max_side=int(args.global_max_side),
+        scene_threshold=float(args.scene_threshold),
+        scene_min_len=int(args.scene_min_len),
+        scene_global_frame=str(args.scene_global_frame),
     )
+    scenes = [(s, e) for (_, s, e) in scene_globals]
 
     ctx = mp.get_context("spawn")
     in_queues = [ctx.Queue(maxsize=int(args.queue_max)) for _ in local_gpu_ids]
@@ -348,7 +410,7 @@ def process_one_video_multi_gpu_single_video(args, in_path: str, out_path: str, 
                 int(args.tile),
                 int(args.halo),
                 int(args.pad_stride),
-                x_global,
+                scene_globals,
                 in_queues[qi],
                 out_queue,
             ),
@@ -365,11 +427,11 @@ def process_one_video_multi_gpu_single_video(args, in_path: str, out_path: str, 
 
     pbar = tqdm(total=frame_count if frame_count > 0 else None, desc=os.path.basename(in_path), unit="f")
 
-    def send_batch(frames_bgr):
+    def send_batch(frames_bgr, scene_id):
         nonlocal rr, next_batch_id, sent_batches
         bid = next_batch_id
         next_batch_id += 1
-        in_queues[rr].put((bid, frames_bgr))
+        in_queues[rr].put((bid, frames_bgr, int(scene_id)))
         rr = (rr + 1) % len(in_queues)
         sent_batches += 1
         return bid
@@ -391,26 +453,38 @@ def process_one_video_multi_gpu_single_video(args, in_path: str, out_path: str, 
             done_batches += 1
 
     buf = []
-    eof = False
+    buf_sid = None
+    frame_idx = 0
+
     while True:
         ok, frame = cap.read()
         if not ok:
-            eof = True
-        else:
-            buf.append(frame)
-
-        if (not eof) and len(buf) < batch_n:
-            drain_outputs_nonblock()
-            continue
-
-        if len(buf) > 0:
-            send_batch(buf)
-            buf = []
-
-        drain_outputs_nonblock()
-
-        if eof:
             break
+
+        sid = scene_id_for_frame(frame_idx, scenes)
+
+        if buf_sid is None:
+            buf_sid = sid
+
+        if sid != buf_sid:
+            if len(buf) > 0:
+                send_batch(buf, buf_sid)
+                buf = []
+            buf_sid = sid
+
+        buf.append(frame)
+        frame_idx += 1
+
+        if len(buf) >= batch_n:
+            send_batch(buf, buf_sid)
+            buf = []
+            drain_outputs_nonblock()
+        else:
+            drain_outputs_nonblock()
+
+    if len(buf) > 0:
+        send_batch(buf, buf_sid)
+        buf = []
 
     while done_batches < sent_batches:
         bid, outs_bgr = out_queue.get()
@@ -436,7 +510,7 @@ def process_one_video_multi_gpu_single_video(args, in_path: str, out_path: str, 
 
     return out_path
 
-def process_one_video_single_gpu(args, in_path: str, out_path: str) -> str:
+def process_one_video_single_gpu(args, in_path: str, out_path: str):
     cap = cv2.VideoCapture(in_path)
     if not cap.isOpened():
         raise RuntimeError(f"cannot open video: {in_path}")
@@ -464,54 +538,66 @@ def process_one_video_single_gpu(args, in_path: str, out_path: str) -> str:
     else:
         session = build_session(args.onnx, "cpu", 0)
 
-    x_global = estimate_global_input_from_samples(
+    scene_globals = build_scene_globals(
         in_path=in_path,
-        max_side=int(args.global_max_side),
-        sample_n=int(args.sample_n),
+        global_max_side=int(args.global_max_side),
+        scene_threshold=float(args.scene_threshold),
+        scene_min_len=int(args.scene_min_len),
+        scene_global_frame=str(args.scene_global_frame),
     )
+    globals_only = [g for (g, _, _) in scene_globals]
+    scenes = [(s, e) for (_, s, e) in scene_globals]
 
     batch_n = max(1, int(args.frame_batch))
     pbar = tqdm(total=frame_count if frame_count > 0 else None, desc=os.path.basename(in_path), unit="f")
 
     buf = []
+    buf_sid = None
+    frame_idx = 0
+
+    def flush_buf():
+        nonlocal buf, buf_sid
+        if buf_sid is None or len(buf) == 0:
+            buf = []
+            return
+        x_global = globals_only[max(0, min(int(buf_sid), len(globals_only) - 1))]
+        for f in buf:
+            x_full = bgr_to_numpy_rgb01(f).astype(np.float32)
+            pred = tile_inference_blend_onnx(
+                session=session,
+                x_full=x_full,
+                x_global=x_global,
+                tile=int(args.tile),
+                halo=int(args.halo),
+                pad_stride=int(args.pad_stride),
+            )
+            out_bgr = numpy_rgb01_to_bgr_u8(pred)
+            writer.write(out_bgr)
+            pbar.update(1)
+        buf = []
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+
+        sid = scene_id_for_frame(frame_idx, scenes)
+
+        if buf_sid is None:
+            buf_sid = sid
+
+        if sid != buf_sid:
+            flush_buf()
+            buf_sid = sid
+
         buf.append(frame)
-        if len(buf) < batch_n:
-            continue
+        frame_idx += 1
 
-        for f in buf:
-            x_full = bgr_to_numpy_rgb01(f).astype(np.float32)
-            pred = tile_inference_blend_onnx(
-                session=session,
-                x_full=x_full,
-                x_global=x_global,
-                tile=int(args.tile),
-                halo=int(args.halo),
-                pad_stride=int(args.pad_stride),
-            )
-            out_bgr = numpy_rgb01_to_bgr_u8(pred)
-            writer.write(out_bgr)
-            pbar.update(1)
-
-        buf = []
+        if len(buf) >= batch_n:
+            flush_buf()
 
     if len(buf) > 0:
-        for f in buf:
-            x_full = bgr_to_numpy_rgb01(f).astype(np.float32)
-            pred = tile_inference_blend_onnx(
-                session=session,
-                x_full=x_full,
-                x_global=x_global,
-                tile=int(args.tile),
-                halo=int(args.halo),
-                pad_stride=int(args.pad_stride),
-            )
-            out_bgr = numpy_rgb01_to_bgr_u8(pred)
-            writer.write(out_bgr)
-            pbar.update(1)
+        flush_buf()
 
     pbar.close()
     cap.release()
